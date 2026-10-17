@@ -44,6 +44,7 @@ public sealed class GatewayConfig
     public McpAppsConfig McpApps { get; set; } = new();
     public McpCompatibilityConfig McpCompatibility { get; set; } = new();
     public MetaInvocationsConfig MetaInvocations { get; set; } = new();
+    public IntegrationConfig Integration { get; set; } = new();
     public DeploymentConfig Deployment { get; set; } = new();
     public TailscaleConfig Tailscale { get; set; } = new();
     public GmailPubSubConfig GmailPubSub { get; set; } = new();
@@ -95,6 +96,30 @@ public sealed class McpCompatibilityConfig
 public sealed class MetaInvocationsConfig
 {
     public int RetentionDays { get; set; } = 30;
+}
+
+/// <summary>Integration-plane settings consumed by programmatic callers (DrasiWake and friends).</summary>
+public sealed class IntegrationConfig
+{
+    public MetaApprovalsConfig MetaApprovals { get; set; } = new();
+}
+
+public sealed class MetaApprovalsConfig
+{
+    /// <summary>
+    /// When false (default) a meta step that needs a tool approval is auto-denied exactly as
+    /// before, so enabling the channel is an explicit opt-in.
+    /// </summary>
+    public bool Enabled { get; set; }
+
+    /// <summary>How long a pending approval stays actionable.</summary>
+    public TimeSpan Timeout { get; set; } = TimeSpan.FromDays(7);
+
+    /// <summary>How long an approved decision may be used to let the tool run.</summary>
+    public TimeSpan GrantTtl { get; set; } = TimeSpan.FromMinutes(15);
+
+    /// <summary>Approval store directory; defaults to the meta invocation ledger root.</summary>
+    public string? StoragePath { get; set; }
 }
 
 public sealed class TokenCostRateConfig

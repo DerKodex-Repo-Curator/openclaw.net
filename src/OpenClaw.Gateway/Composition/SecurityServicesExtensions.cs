@@ -3,6 +3,7 @@ using OpenClaw.Core.ExternalCli;
 using OpenClaw.Core.Pipeline;
 using OpenClaw.Core.Security;
 using OpenClaw.Gateway.Bootstrap;
+using OpenClaw.Gateway.Approvals;
 using OpenClaw.Gateway.Security;
 
 namespace OpenClaw.Gateway.Composition;
@@ -15,6 +16,28 @@ internal static class SecurityServicesExtensions
             startup.Config.Memory.StoragePath,
             startup.Config.MetaInvocations.RetentionDays));
         services.AddHostedService(sp => sp.GetRequiredService<MetaInvocationStore>());
+        // The meta approval channel is opt-in: without the switch a gated tool is auto-denied.
+        if (startup.Config.Integration.MetaApprovals.Enabled)
+        {
+            services.AddSingleton(sp =>
+            {
+                var options = startup.Config.Integration.MetaApprovals;
+                return new MetaApprovalStore(
+                    new MetaApprovalOptions
+                    {
+                        Enabled = options.Enabled,
+                        Timeout = options.Timeout,
+                        GrantTtl = options.GrantTtl,
+                        StoragePath = options.StoragePath
+                    },
+                    startup.Config.Memory.StoragePath,
+                    sp.GetRequiredService<ILogger<MetaApprovalStore>>());
+            });
+            services.AddSingleton<OpenClaw.Core.Approvals.IMetaApprovalStore>(
+                sp => sp.GetRequiredService<MetaApprovalStore>());
+            services.AddHostedService(sp => sp.GetRequiredService<MetaApprovalStore>());
+        }
+
         services.AddSingleton(sp => new DeviceEnrollmentService(sp.GetRequiredService<OperatorAccountService>(), TimeProvider.System));
         // Register OIDC/JWT Bearer authentication when an OIDC Authority is configured,
         // regardless of AuthMode. This allows JWT tokens (e.g. from the web chat's

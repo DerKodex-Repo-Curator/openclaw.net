@@ -11,6 +11,7 @@ using OpenClaw.Agent.Execution;
 using OpenClaw.Agent.Routing;
 using OpenClaw.Agent.Tools;
 using OpenClaw.Core.Abstractions;
+using OpenClaw.Core.Approvals;
 using OpenClaw.Core.Memory;
 using OpenClaw.Core.Models;
 using OpenClaw.Core.Observability;
@@ -125,7 +126,8 @@ public sealed class AgentRuntime : IAgentRuntime
         ITurnRoutingPolicy? turnRoutingPolicy = null,
         IGoalService? goalService = null,
         IReadOnlyList<IToolResultInterceptor>? interceptors = null,
-        CapabilitySlotExecutor? capabilitySlotExecutor = null)
+        CapabilitySlotExecutor? capabilitySlotExecutor = null,
+        IMetaApprovalStore? metaApprovals = null)
     {
         _logger = logger;
         _capabilitySlotExecutor = capabilitySlotExecutor;
@@ -178,7 +180,8 @@ public sealed class AgentRuntime : IAgentRuntime
             planExecuteVerify: planExecuteVerify,
             auditLog: toolAuditLog,
             interceptors: interceptors,
-            contextualMetaInvokeExecutor: (session, skillName, input, token, callerContext) => ExecuteMetaSkillWithCallerContextAsync(session, skillName, input, token, callerContext));
+            contextualMetaInvokeExecutor: (session, skillName, input, token, callerContext) => ExecuteMetaSkillWithCallerContextAsync(session, skillName, input, token, callerContext),
+            metaApprovals: metaApprovals);
         _sessionTokenBudget = sessionTokenBudget;
         _estimateTokenBudgetAdmission = gatewayConfig?.EnableEstimatedTokenAdmissionControl ?? false;
         _fractalMemory = gatewayConfig?.Memory.Fractal;
@@ -1368,7 +1371,10 @@ public sealed class AgentRuntime : IAgentRuntime
                 ClearMetaExecutionCheckpoint(session, metaSkill.Name);
             }
 
-            if (string.IsNullOrWhiteSpace(input) && !timeoutHandledByFailureBranch && !resumedSkipClarify)
+            if (string.IsNullOrWhiteSpace(input) &&
+                !timeoutHandledByFailureBranch &&
+                !resumedSkipClarify &&
+                !IsToolApprovalCheckpoint(session))
             {
                 return ReturnMetaExecutionOutput(
                     session,
@@ -1610,6 +1616,31 @@ public sealed class AgentRuntime : IAgentRuntime
                             ExecutionEvidence: toolResult.BindingTrajectory is null
                                 ? null
                                 : new SessionMetaStepExecutionEvidence { CapabilityBinding = toolResult.BindingTrajectory, CapabilityInvocation = toolResult.CapabilityInvocation }));
+
+                        if (toolResult.ApprovalId is { Length: > 0 } approvalId)
+                        {
+                            // The tool call is parked on a human decision: keep the durable
+                            // checkpoint so the same run can be resumed once it is approved.
+                            SaveMetaExecutionCheckpoint(
+                                session,
+                                metaSkill.Name,
+                                step.Id,
+                                toolResult.FailureMessage ?? $"Tool approval required for step '{step.Id}'.",
+                                pending,
+                                blocked,
+                                outputs,
+                                failureAliases,
+                                stepResults,
+                                reason: "tool_approval",
+                                approvalId: approvalId);
+                            return ReturnMetaExecutionOutput(
+                                session,
+                                metaSkill,
+                                finalText: null,
+                                stepResults,
+                                $"Meta step '{step.Id}' is waiting for approval '{approvalId}'.",
+                                preserveCheckpoint: true);
+                        }
 
                         if (completed)
                         {
@@ -2354,7 +2385,8 @@ public sealed class AgentRuntime : IAgentRuntime
                 session,
                 turnCtx,
                 callerCredentialContext,
-                ct);
+                ct,
+                allowApprovalParking: false); // A parallel wave cannot pause on one step.
             stepSw.Stop();
             return new MetaParallelToolStepExecution(candidate.Step, toolResult, stepSw.Elapsed.TotalMilliseconds);
         }));
@@ -2688,13 +2720,17 @@ public sealed class AgentRuntime : IAgentRuntime
         HashSet<string> blocked,
         Dictionary<string, string> outputs,
         Dictionary<string, string> failureAliases,
-        IReadOnlyList<MetaStepExecutionResult> stepResults)
+        IReadOnlyList<MetaStepExecutionResult> stepResults,
+        string reason = "user_input",
+        string? approvalId = null)
     {
         session.MetaExecutionCheckpoint = new SessionMetaExecutionCheckpoint
         {
             SkillName = skillName,
             PendingStepId = pendingStepId,
             Prompt = prompt,
+            Reason = reason,
+            ApprovalId = approvalId,
             LastUpdatedAtUtc = DateTimeOffset.UtcNow,
             PendingStepIds = pending.ToList(),
             BlockedStepIds = blocked.ToList(),
@@ -2737,6 +2773,20 @@ public sealed class AgentRuntime : IAgentRuntime
             ParseMode = string.IsNullOrWhiteSpace(parseMode) ? "text" : parseMode
         };
     }
+
+    /// <summary>
+    /// A tool-approval pause is unblocked by a decision, not by input: the run must re-enter
+    /// with an empty answer once the approval is granted.
+    /// </summary>
+    private static bool IsToolApprovalCheckpoint(Session session)
+        => string.Equals(
+            session.MetaExecutionCheckpoint?.Reason,
+            "tool_approval",
+            StringComparison.OrdinalIgnoreCase);
+
+    private static string ResolveMetaApprovalCallerId(Session session)
+        => session.AuthenticatedUserId
+           ?? (string.IsNullOrWhiteSpace(session.OwnerAccountId) ? "unknown" : session.OwnerAccountId);
 
     private static void ClearMetaExecutionCheckpoint(Session session, string skillName)
     {
@@ -2861,7 +2911,8 @@ public sealed class AgentRuntime : IAgentRuntime
         Session session,
         TurnContext turnCtx,
         McpCallerCredentialContext? callerCredentialContext,
-        CancellationToken ct)
+        CancellationToken ct,
+        bool allowApprovalParking = true)
     {
         var maxAttempts = Math.Max(1, step.Retry.MaxAttempts);
         ToolExecutionResult? lastResult = null;
@@ -2883,7 +2934,13 @@ public sealed class AgentRuntime : IAgentRuntime
                     ct: effectiveCt,
                     onDelta: null,
                     toolCallCount: 1,
-                    callerCredentialContext: callerCredentialContext); // A retry still executes a single tool.
+                    callerCredentialContext: callerCredentialContext,
+                    metaApproval: allowApprovalParking
+                        ? new MetaApprovalContext(
+                            metaSkill?.Name ?? "fan_out",
+                            step.Id,
+                            ResolveMetaApprovalCallerId(session))
+                        : null); // A retry still executes a single tool.
             }
             catch (OperationCanceledException) when (!ct.IsCancellationRequested)
             {

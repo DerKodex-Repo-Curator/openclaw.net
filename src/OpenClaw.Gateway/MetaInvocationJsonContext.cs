@@ -10,5 +10,11 @@ namespace OpenClaw.Gateway;
 [JsonSerializable(typeof(MetaInvocationRecord))]
 [JsonSerializable(typeof(List<MetaInvocationRecord>))]
 [JsonSerializable(typeof(MetaSkillInvocationRequest))]
+[JsonSerializable(typeof(MetaInvocationResumeRequest))]
 [JsonSerializable(typeof(MetaInvocationResponse))]
+[JsonSerializable(typeof(MetaInvocationPauseInfo))]
+[JsonSerializable(typeof(MetaApprovalSummary))]
+[JsonSerializable(typeof(MetaApprovalSummary[]))]
+[JsonSerializable(typeof(MetaApprovalDecisionRequest))]
+[JsonSerializable(typeof(MetaApprovalReceipt))]
 internal sealed partial class MetaInvocationJsonContext : JsonSerializerContext;

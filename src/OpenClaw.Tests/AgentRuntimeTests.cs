@@ -1000,6 +1000,94 @@ public class AgentRuntimeTests
     }
 
     [Fact]
+    public async Task ExecuteMetaSkillAsync_ToolApprovalParksAndResumesWithBlankInputAfterGrant()
+    {
+        var gatedTool = new CountingTool("gated_tool", "charged");
+        var approvalsRoot = Path.Join(Path.GetTempPath(), "openclaw-meta-approval-runtime", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(approvalsRoot);
+        using var approvals = new OpenClaw.Gateway.Approvals.MetaApprovalStore(
+            new OpenClaw.Gateway.Approvals.MetaApprovalOptions { Enabled = true },
+            approvalsRoot);
+
+        try
+        {
+            var agent = new AgentRuntime(
+                _chatClient,
+                [gatedTool],
+                _memory,
+                _config,
+                maxHistoryTurns: 5,
+                requireToolApproval: true,
+                approvalRequiredTools: ["gated_tool"],
+                skills:
+                [
+                    new SkillDefinition
+                    {
+                        Name = "meta-flow",
+                        Description = "meta flow",
+                        Instructions = "...",
+                        Location = "/skills/meta-flow",
+                        Kind = SkillKind.Meta,
+                        FinalTextMode = "step:charge",
+                        Composition = new MetaSkillComposition
+                        {
+                            Steps =
+                            [
+                                new MetaSkillStepDefinition
+                                {
+                                    Id = "charge",
+                                    Kind = "tool_call",
+                                    Tool = "gated_tool"
+                                }
+                            ]
+                        }
+                    }
+                ],
+                metaApprovals: approvals);
+
+            var session = new Session { Id = "meta-approval-sess", ChannelId = "test-channel", SenderId = "user1" };
+
+            var parked = await InvokeMetaSkillAsync(agent, session, "meta-flow", "go", TestContext.Current.CancellationToken);
+
+            Assert.Contains("waiting for approval", parked, StringComparison.OrdinalIgnoreCase);
+            Assert.NotNull(session.MetaExecutionCheckpoint);
+            Assert.Equal("tool_approval", session.MetaExecutionCheckpoint!.Reason);
+            var approvalId = session.MetaExecutionCheckpoint.ApprovalId;
+            Assert.False(string.IsNullOrWhiteSpace(approvalId));
+            Assert.Equal(0, gatedTool.CallCount);
+
+            // A blank answer without a decision must not run the tool.
+            await InvokeMetaSkillAsync(agent, session, "meta-flow", string.Empty, TestContext.Current.CancellationToken);
+            Assert.Equal(0, gatedTool.CallCount);
+
+            var decided = await approvals.TryDecideAsync(
+                approvalId!,
+                approved: true,
+                "reviewer",
+                "ok",
+                TestContext.Current.CancellationToken);
+            Assert.Equal(OpenClaw.Core.Approvals.MetaApprovalDecideStatus.Recorded, decided);
+
+            // Resuming a tool-approval pause carries no user answer: the grant is what unblocks it.
+            var resumed = await InvokeMetaSkillAsync(agent, session, "meta-flow", string.Empty, TestContext.Current.CancellationToken);
+
+            Assert.Null(session.MetaExecutionCheckpoint);
+            Assert.Equal(1, gatedTool.CallCount);
+            Assert.DoesNotContain("waiting for approval", resumed, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            try
+            {
+                Directory.Delete(approvalsRoot, recursive: true);
+            }
+            catch (IOException)
+            {
+            }
+        }
+    }
+
+    [Fact]
     public async Task ExecuteMetaSkillAsync_OnFailureFallbackUserInputResume_MirrorsOutputToPrimaryStep()
     {
         var failingTool = new ThrowingTool("failing_tool", "boom");

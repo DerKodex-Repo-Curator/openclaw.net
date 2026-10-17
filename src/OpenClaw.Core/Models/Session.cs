@@ -291,6 +291,16 @@ public sealed class SessionMetaExecutionCheckpoint
     public required string SkillName { get; init; }
     public required string PendingStepId { get; init; }
     public string? Prompt { get; init; }
+
+    /// <summary>
+    /// Why the run stopped: "user_input" (the step needs a human answer) or "tool_approval"
+    /// (a tool call needs an approval decision). Older checkpoints deserialize as "user_input".
+    /// </summary>
+    public string Reason { get; init; } = "user_input";
+
+    /// <summary>Approval id a tool-approval pause is waiting on; null for user-input pauses.</summary>
+    public string? ApprovalId { get; init; }
+
     public DateTimeOffset CreatedAtUtc { get; init; } = DateTimeOffset.UtcNow;
     public DateTimeOffset LastUpdatedAtUtc { get; set; } = DateTimeOffset.UtcNow;
     public List<string> PendingStepIds { get; init; } = [];

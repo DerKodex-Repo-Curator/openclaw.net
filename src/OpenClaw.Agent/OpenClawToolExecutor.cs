@@ -8,6 +8,7 @@ using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging;
 using OpenClaw.Agent.Execution;
 using OpenClaw.Core.Abstractions;
+using OpenClaw.Core.Approvals;
 using OpenClaw.Core.Governance;
 using OpenClaw.Core.Models;
 using OpenClaw.Core.Observability;
@@ -25,6 +26,12 @@ public sealed class ToolExecutionResult
     public string? FailureCode { get; init; }
     public string? FailureMessage { get; init; }
     public string? NextStep { get; init; }
+
+    /// <summary>
+    /// Set when the call was parked for a human approval instead of being denied: the meta
+    /// step must persist a <c>tool_approval</c> checkpoint and pause the run on this id.
+    /// </summary>
+    public string? ApprovalId { get; init; }
     public ToolInvocation? CapabilityInvocation { get; set; }
     public CapabilityBindingTrajectory? BindingTrajectory { get; set; }
     public bool RetrySafe { get; set; }
@@ -58,6 +65,7 @@ public sealed class OpenClawToolExecutor
     private readonly IPlanExecuteVerifyOrchestrator _planExecuteVerify;
     private readonly Func<Session, string, string?, CancellationToken, Task<string>>? _metaInvokeExecutor;
     private readonly Func<Session, string, string?, CancellationToken, McpCallerCredentialContext?, Task<string>>? _contextualMetaInvokeExecutor;
+    private readonly IMetaApprovalStore? _metaApprovals;
 
     public OpenClawToolExecutor(
         IReadOnlyList<ITool> tools,
@@ -79,7 +87,8 @@ public sealed class OpenClawToolExecutor
         IPlanExecuteVerifyOrchestrator? planExecuteVerify = null,
         Func<Session, string, string?, CancellationToken, Task<string>>? metaInvokeExecutor = null,
         IReadOnlyList<IToolResultInterceptor>? interceptors = null,
-        Func<Session, string, string?, CancellationToken, McpCallerCredentialContext?, Task<string>>? contextualMetaInvokeExecutor = null)
+        Func<Session, string, string?, CancellationToken, McpCallerCredentialContext?, Task<string>>? contextualMetaInvokeExecutor = null,
+        IMetaApprovalStore? metaApprovals = null)
     {
         _toolsByName = tools.ToDictionary(t => t.Name, StringComparer.Ordinal);
         _toolDeclarations = tools.Select(CreateDeclaration).Cast<AITool>().ToArray();
@@ -110,6 +119,7 @@ public sealed class OpenClawToolExecutor
         _sentinelSubstitution = sentinelSubstitution ?? new NoopSentinelSubstitutionService();
         _toolGovernance = toolGovernance ?? new NoopToolGovernanceService();
         _planExecuteVerify = planExecuteVerify ?? NoopPlanExecuteVerifyOrchestrator.Instance;
+        _metaApprovals = metaApprovals;
         _metaInvokeExecutor = metaInvokeExecutor;
         _contextualMetaInvokeExecutor = contextualMetaInvokeExecutor;
         _interceptors = interceptors;
@@ -217,13 +227,14 @@ public sealed class OpenClawToolExecutor
         CancellationToken ct,
         Func<string, ValueTask>? onDelta = null,
         int toolCallCount = 1,
-        McpCallerCredentialContext? callerCredentialContext = null)
+        McpCallerCredentialContext? callerCredentialContext = null,
+        MetaApprovalContext? metaApproval = null)
     {
         var argsJson = call.Arguments is not null
             ? JsonSerializer.Serialize(call.Arguments, CoreJsonContext.Default.IDictionaryStringObject)
             : "{}";
 
-        return await ExecuteAsync(call.Name, argsJson, call.CallId, session, turnCtx, isStreaming, approvalCallback, ct, onDelta, toolCallCount, callerCredentialContext: callerCredentialContext);
+        return await ExecuteAsync(call.Name, argsJson, call.CallId, session, turnCtx, isStreaming, approvalCallback, ct, onDelta, toolCallCount, callerCredentialContext: callerCredentialContext, metaApproval: metaApproval);
     }
 
     public async Task<ToolExecutionResult> ExecuteAsync(
@@ -237,7 +248,8 @@ public sealed class OpenClawToolExecutor
         CancellationToken ct,
         Func<string, ValueTask>? onDelta = null,
         int toolCallCount = 1, ITool? boundCapabilityTool = null,
-        McpCallerCredentialContext? callerCredentialContext = null)
+        McpCallerCredentialContext? callerCredentialContext = null,
+        MetaApprovalContext? metaApproval = null)
     {
         using var activity = Telemetry.ActivitySource.StartActivity("Agent.ExecuteTool");
         activity?.SetTag("tool.name", toolName);
@@ -520,26 +532,22 @@ public sealed class OpenClawToolExecutor
             }
             else
             {
-                _logger?.LogWarning(
-                    "[{CorrelationId}] Tool {Tool} requires approval but no approval channel is available — denied",
-                    turnCtx.CorrelationId,
-                    tool.Name);
-                var approvalMessage =
-                    $"Tool '{tool.Name}' requires approval but this session has no approval channel — auto-denied. " +
-                    "To enable this tool: connect through the browser chat at /chat (it supports interactive approvals) " +
-                    "or set OpenClaw:Tooling:RequireToolApproval=false for trusted local sessions.";
-                var deniedResult = CreateImmediateResult(
-                    toolName,
+                var parked = await ResolveMissingApprovalAsync(
+                    tool,
                     persistedArgsJson,
-                    _redaction.Redact(approvalMessage),
-                    callId: callId,
-                    resultStatus: ToolResultStatuses.Blocked,
-                    failureCode: ToolFailureCodes.ApprovalRequired,
-                    failureMessage: approvalMessage,
-                    nextStep: "Use an approval-capable surface such as /chat, or disable approval requirements for trusted local sessions.",
-                    governanceDecision: governanceDecision);
-                await _planExecuteVerify.RecordApprovalDecisionAsync(pevDecision.Run, approved: false, ct);
-                return deniedResult;
+                    approvalDescriptor,
+                    session,
+                    turnCtx,
+                    metaApproval,
+                    toolName,
+                    callId,
+                    governanceDecision,
+                    ct);
+                if (parked is not null)
+                {
+                    await _planExecuteVerify.RecordApprovalDecisionAsync(pevDecision.Run, approved: false, ct);
+                    return parked;
+                }
             }
         }
 
@@ -887,7 +895,8 @@ public sealed class OpenClawToolExecutor
         string? failureCode = null,
         string? failureMessage = null,
         string? nextStep = null,
-        GovernanceDecision? governanceDecision = null)
+        GovernanceDecision? governanceDecision = null,
+        string? approvalId = null)
     {
         var invocation = new ToolInvocation
         {
@@ -917,7 +926,8 @@ public sealed class OpenClawToolExecutor
             ResultStatus = resultStatus,
             FailureCode = failureCode,
             FailureMessage = failureMessage,
-            NextStep = nextStep
+            NextStep = nextStep,
+            ApprovalId = approvalId
         };
     }
 
@@ -1088,6 +1098,97 @@ public sealed class OpenClawToolExecutor
         => tool is IToolActionDescriptorProvider descriptorProvider
             ? descriptorProvider.ResolveActionDescriptor(argsJson)
             : ToolActionPolicyResolver.Resolve(tool.Name, argsJson);
+
+    /// <summary>
+    /// Decides what happens when a tool needs approval but this surface has no interactive
+    /// approval callback. Returns null when an approved meta grant lets the call proceed;
+    /// otherwise returns the terminal (or parked) result the caller must report.
+    /// </summary>
+    private async Task<ToolExecutionResult?> ResolveMissingApprovalAsync(
+        ITool tool,
+        string persistedArgsJson,
+        ToolActionDescriptor approvalDescriptor,
+        Session session,
+        TurnContext turnCtx,
+        MetaApprovalContext? metaApproval,
+        string toolName,
+        string? callId,
+        GovernanceDecision? governanceDecision,
+        CancellationToken ct)
+    {
+        var fingerprint = string.IsNullOrWhiteSpace(approvalDescriptor.ApprovalFingerprint)
+            ? ComputeArgsFingerprint(tool.Name, persistedArgsJson)
+            : approvalDescriptor.ApprovalFingerprint!;
+
+        if (_metaApprovals is not null && metaApproval is not null)
+        {
+            var grant = await _metaApprovals.FindActiveGrantAsync(session.Id, tool.Name, fingerprint, ct);
+            if (grant is not null)
+            {
+                await _metaApprovals.MarkConsumedAsync(grant.ApprovalId, ct);
+                _logger?.LogInformation(
+                    "[{CorrelationId}] Tool {Tool} runs under meta approval {ApprovalId}.",
+                    turnCtx.CorrelationId,
+                    tool.Name,
+                    grant.ApprovalId);
+                return null;
+            }
+
+            var request = new MetaApprovalRequest(
+                session.Id,
+                metaApproval.CallerId,
+                metaApproval.SkillName,
+                metaApproval.StepId,
+                tool.Name,
+                persistedArgsJson,
+                fingerprint,
+                approvalDescriptor.Summary);
+            var approval = await _metaApprovals.GetOrCreateAsync(request, ct);
+            _logger?.LogInformation(
+                "[{CorrelationId}] Tool {Tool} parked for meta approval {ApprovalId} (step {StepId}).",
+                turnCtx.CorrelationId,
+                tool.Name,
+                approval.ApprovalId,
+                metaApproval.StepId);
+            var parkedMessage =
+                $"Tool '{tool.Name}' requires human approval before it may run; approval '{approval.ApprovalId}' is pending.";
+            return CreateImmediateResult(
+                toolName,
+                persistedArgsJson,
+                _redaction.Redact(parkedMessage),
+                callId: callId,
+                resultStatus: ToolResultStatuses.Blocked,
+                failureCode: ToolFailureCodes.ApprovalRequired,
+                failureMessage: parkedMessage,
+                nextStep: $"approval pending: {approval.ApprovalId}",
+                governanceDecision: governanceDecision,
+                approvalId: approval.ApprovalId);
+        }
+
+        _logger?.LogWarning(
+            "[{CorrelationId}] Tool {Tool} requires approval but no approval channel is available — denied",
+            turnCtx.CorrelationId,
+            tool.Name);
+        var approvalMessage =
+            $"Tool '{tool.Name}' requires approval but this session has no approval channel — auto-denied. " +
+            "To enable this tool: connect through the browser chat at /chat (it supports interactive approvals) " +
+            "or set OpenClaw:Tooling:RequireToolApproval=false for trusted local sessions.";
+        return CreateImmediateResult(
+            toolName,
+            persistedArgsJson,
+            _redaction.Redact(approvalMessage),
+            callId: callId,
+            resultStatus: ToolResultStatuses.Blocked,
+            failureCode: ToolFailureCodes.ApprovalRequired,
+            failureMessage: approvalMessage,
+            nextStep: "Use an approval-capable surface such as /chat, or disable approval requirements for trusted local sessions.",
+            governanceDecision: governanceDecision);
+    }
+
+    private static string ComputeArgsFingerprint(string toolName, string argsJson)
+        => Convert.ToHexString(
+            System.Security.Cryptography.SHA256.HashData(
+                System.Text.Encoding.UTF8.GetBytes(toolName + "|" + argsJson)))[..32];
 
     private async Task<string> ExecuteStreamingToolCollectAsync(
         IStreamingTool tool,

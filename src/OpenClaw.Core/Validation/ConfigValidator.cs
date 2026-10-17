@@ -113,6 +113,11 @@ public static class ConfigValidator
         if (config.MetaInvocations.RetentionDays < 1)
             errors.Add($"MetaInvocations.RetentionDays must be >= 1 (got {config.MetaInvocations.RetentionDays}).");
 
+        if (config.Integration.MetaApprovals.Timeout <= TimeSpan.Zero)
+            errors.Add("Integration.MetaApprovals.Timeout must be positive.");
+        if (config.Integration.MetaApprovals.GrantTtl <= TimeSpan.Zero)
+            errors.Add("Integration.MetaApprovals.GrantTtl must be positive.");
+
         // Sessions
         if (config.MaxConcurrentSessions < 1)
             errors.Add($"MaxConcurrentSessions must be >= 1 (got {config.MaxConcurrentSessions}).");

@@ -1,6 +1,7 @@
 using OpenClaw.Core.Abstractions;
 using OpenClaw.Core.Models;
 using OpenClaw.Core.Sessions;
+using System.Text;
 using System.Text.Json;
 using OpenClaw.Gateway.Bootstrap;
 using OpenClaw.Gateway.Composition;
@@ -12,6 +13,9 @@ namespace OpenClaw.Gateway.Endpoints;
 
 internal static class IntegrationEndpoints
 {
+    /// <summary>Upper bound for the <c>X-OpenClaw-Resume</c> header payload.</summary>
+    private const int MaxResumeHeaderBytes = 32 * 1024;
+
     public static void MapOpenClawIntegrationEndpoints(
         this WebApplication app,
         GatewayStartupContext startup,
@@ -59,13 +63,40 @@ internal static class IntegrationEndpoints
                 return BadIntegrationRequest("sessionId is required.");
 
             var caller = EndpointHelpers.ResolveCaller(ctx, startup);
+
+            // A resume continues the same invocation: the header is not part of the request hash.
+            var resume = default(MetaInvocationResumeRequest);
+            var resumeHeaders = ctx.Request.Headers["X-OpenClaw-Resume"];
+            if (resumeHeaders.Count > 1)
+                return BadIntegrationRequest("X-OpenClaw-Resume must be sent at most once.");
+            if (resumeHeaders.Count == 1 && !string.IsNullOrWhiteSpace(resumeHeaders[0]))
+            {
+                var rawResume = resumeHeaders[0]!;
+                if (Encoding.UTF8.GetByteCount(rawResume) > MaxResumeHeaderBytes)
+                    return BadIntegrationRequest($"X-OpenClaw-Resume must not exceed {MaxResumeHeaderBytes} bytes.");
+                try
+                {
+                    resume = JsonSerializer.Deserialize(
+                        rawResume,
+                        MetaInvocationJsonContext.Default.MetaInvocationResumeRequest);
+                }
+                catch (JsonException)
+                {
+                    return BadIntegrationRequest("Invalid JSON in the X-OpenClaw-Resume header.");
+                }
+
+                if (resume is null)
+                    return BadIntegrationRequest("Invalid JSON in the X-OpenClaw-Resume header.");
+            }
+
             var outcome = await facade.InvokeMetaSkillAsync(
                 caller.AccountId ?? "bootstrap",
                 caller.AccountId,
                 caller.IsAdmin,
                 idempotencyKey,
                 request,
-                ctx.RequestAborted);
+                ctx.RequestAborted,
+                resume);
 
             if (outcome.Response is not null)
             {
@@ -79,6 +110,108 @@ internal static class IntegrationEndpoints
                 new OperationStatusResponse { Success = false, Error = outcome.Error },
                 CoreJsonContext.Default.OperationStatusResponse,
                 statusCode: outcome.StatusCode);
+        });
+
+        group.MapGet("/meta-approvals", async (HttpContext ctx) =>
+        {
+            var failure = AuthorizeAndConsume(ctx, startup, runtime, browserSessions, endpointScope: "integration.read", requireCsrf: false);
+            if (failure is not null)
+                return failure;
+
+            var approvals = app.Services.GetService<OpenClaw.Core.Approvals.IMetaApprovalStore>();
+            if (approvals is null)
+                return Results.Json(
+                    new OperationStatusResponse { Success = false, Error = "Meta approvals are disabled." },
+                    CoreJsonContext.Default.OperationStatusResponse,
+                    statusCode: StatusCodes.Status404NotFound);
+
+            var caller = EndpointHelpers.ResolveCaller(ctx, startup);
+            var sessionId = ctx.Request.Query["sessionId"].ToString();
+            var pendingOnly = !string.Equals(ctx.Request.Query["status"].ToString(), "all", StringComparison.OrdinalIgnoreCase);
+            var records = await approvals.ListAsync(
+                caller.AccountId ?? "bootstrap",
+                string.IsNullOrWhiteSpace(sessionId) ? null : sessionId,
+                pendingOnly,
+                ctx.RequestAborted);
+            return Results.Json(
+                records.Select(static record => new MetaApprovalSummary(
+                    record.ApprovalId,
+                    record.SessionId,
+                    record.SkillName,
+                    record.StepId,
+                    record.ToolName,
+                    record.Summary,
+                    record.ArgsFingerprint,
+                    record.CreatedAtUtc,
+                    record.ExpiresAtUtc,
+                    record.Decision,
+                    record.DecidedBy,
+                    record.DecidedAtUtc)).ToArray(),
+                MetaInvocationJsonContext.Default.MetaApprovalSummaryArray);
+        });
+
+        group.MapPost("/meta-approvals/{approvalId}", async (HttpContext ctx, string approvalId) =>
+        {
+            var failure = AuthorizeAndConsume(ctx, startup, runtime, browserSessions, endpointScope: "integration.mutate", requireCsrf: true);
+            if (failure is not null)
+                return failure;
+
+            var approvals = app.Services.GetService<OpenClaw.Core.Approvals.IMetaApprovalStore>();
+            if (approvals is null)
+                return Results.Json(
+                    new OperationStatusResponse { Success = false, Error = "Meta approvals are disabled." },
+                    CoreJsonContext.Default.OperationStatusResponse,
+                    statusCode: StatusCodes.Status404NotFound);
+
+            MetaApprovalDecisionRequest? decision;
+            try
+            {
+                decision = await JsonSerializer.DeserializeAsync(
+                    ctx.Request.Body,
+                    MetaInvocationJsonContext.Default.MetaApprovalDecisionRequest,
+                    ctx.RequestAborted);
+            }
+            catch (JsonException)
+            {
+                return BadIntegrationRequest("Invalid JSON request body.");
+            }
+
+            if (decision is null)
+                return BadIntegrationRequest("request body is required.");
+
+            var caller = EndpointHelpers.ResolveCaller(ctx, startup);
+            var callerId = caller.AccountId ?? "bootstrap";
+            var record = await approvals.TryGetAsync(approvalId, ctx.RequestAborted);
+            if (record is null)
+                return IntegrationNotFound($"Approval '{approvalId}' was not found.");
+            if (!string.Equals(record.CallerId, callerId, StringComparison.Ordinal) && !caller.IsAdmin)
+                return Results.Json(
+                    new OperationStatusResponse { Success = false, Error = "approval.forbidden" },
+                    CoreJsonContext.Default.OperationStatusResponse,
+                    statusCode: StatusCodes.Status403Forbidden);
+
+            var status = await approvals.TryDecideAsync(
+                approvalId,
+                decision.Approved,
+                callerId,
+                decision.Reason,
+                ctx.RequestAborted);
+            if (status == OpenClaw.Core.Approvals.MetaApprovalDecideStatus.AlreadyDecided)
+                return Results.Json(
+                    new OperationStatusResponse { Success = false, Error = "approval.already_decided" },
+                    CoreJsonContext.Default.OperationStatusResponse,
+                    statusCode: StatusCodes.Status409Conflict);
+            if (status == OpenClaw.Core.Approvals.MetaApprovalDecideStatus.NotFound)
+                return IntegrationNotFound($"Approval '{approvalId}' was not found.");
+
+            return Results.Json(
+                new MetaApprovalReceipt(
+                    approvalId,
+                    decision.Approved,
+                    callerId,
+                    DateTimeOffset.UtcNow,
+                    decision.Reason),
+                MetaInvocationJsonContext.Default.MetaApprovalReceipt);
         });
 
         group.MapGet("/capabilities", (HttpContext ctx) =>

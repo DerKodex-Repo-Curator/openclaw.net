@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using Microsoft.Agents.AI;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.DependencyInjection;
@@ -968,6 +968,109 @@ public sealed class MafAdapterTests
         finally
         {
             Directory.Delete(storagePath, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task MafAgentRuntime_ExecuteMetaSkillAsync_ToolApprovalParksAndResumesWithBlankInputAfterGrant()
+    {
+        // MAF counterpart of the Native AgentRuntime approval test: the two runtimes must agree on
+        // "park without executing, stay parked without a decision, run once after the grant".
+        var storagePath = Path.Join(Path.GetTempPath(), "openclaw-maf-meta-approval", Guid.NewGuid().ToString("N"));
+        var approvalsRoot = Path.Join(Path.GetTempPath(), "openclaw-maf-meta-approval-store", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(storagePath);
+        Directory.CreateDirectory(approvalsRoot);
+        using var approvals = new OpenClaw.Gateway.Approvals.MetaApprovalStore(
+            new OpenClaw.Gateway.Approvals.MetaApprovalOptions { Enabled = true },
+            approvalsRoot);
+
+        try
+        {
+            var gatedTool = new CountingMafTool("gated_tool", "charged");
+            var runtime = CreateRuntime(
+                storagePath,
+                new TestLlmExecutionService(),
+                new MafOptions(),
+                tools: [gatedTool],
+                skills:
+                [
+                    new SkillDefinition
+                    {
+                        Name = "meta-flow",
+                        Description = "meta flow",
+                        Instructions = "...",
+                        Location = "/skills/meta-flow",
+                        Kind = SkillKind.Meta,
+                        FinalTextMode = "step:charge",
+                        Composition = new MetaSkillComposition
+                        {
+                            Steps =
+                            [
+                                new MetaSkillStepDefinition
+                                {
+                                    Id = "charge",
+                                    Kind = "tool_call",
+                                    Tool = "gated_tool"
+                                }
+                            ]
+                        }
+                    }
+                ],
+                requireToolApproval: true,
+                approvalRequiredTools: ["gated_tool"],
+                metaApprovals: approvals);
+
+            var session = CreateSession("maf-meta-approval-session");
+
+            var parked = await InvokeMafMetaSkillAsync(
+                runtime, session, "meta-flow", "go", TestContext.Current.CancellationToken);
+
+            Assert.Contains("waiting for approval", parked, StringComparison.OrdinalIgnoreCase);
+            Assert.NotNull(session.MetaExecutionCheckpoint);
+            Assert.Equal("tool_approval", session.MetaExecutionCheckpoint!.Reason);
+            var approvalId = session.MetaExecutionCheckpoint.ApprovalId;
+            Assert.False(string.IsNullOrWhiteSpace(approvalId));
+            Assert.Equal(0, gatedTool.CallCount);
+
+            // A blank answer without a decision must not run the tool.
+            await InvokeMafMetaSkillAsync(
+                runtime, session, "meta-flow", string.Empty, TestContext.Current.CancellationToken);
+            Assert.Equal(0, gatedTool.CallCount);
+            Assert.Equal("tool_approval", session.MetaExecutionCheckpoint!.Reason);
+
+            var decided = await approvals.TryDecideAsync(
+                approvalId!,
+                approved: true,
+                "reviewer",
+                "ok",
+                TestContext.Current.CancellationToken);
+            Assert.Equal(OpenClaw.Core.Approvals.MetaApprovalDecideStatus.Recorded, decided);
+
+            // Resuming a tool-approval pause carries no user answer: the grant is what unblocks it.
+            var resumed = await InvokeMafMetaSkillAsync(
+                runtime, session, "meta-flow", string.Empty, TestContext.Current.CancellationToken);
+
+            Assert.Null(session.MetaExecutionCheckpoint);
+            Assert.Equal(1, gatedTool.CallCount);
+            Assert.DoesNotContain("waiting for approval", resumed, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            try
+            {
+                Directory.Delete(storagePath, recursive: true);
+            }
+            catch (IOException)
+            {
+            }
+
+            try
+            {
+                Directory.Delete(approvalsRoot, recursive: true);
+            }
+            catch (IOException)
+            {
+            }
         }
     }
 
@@ -3768,11 +3871,18 @@ public sealed class MafAdapterTests
         ITurnRoutingPolicy? routingPolicy = null,
         IReadOnlyList<ITool>? tools = null,
         IReadOnlyList<SkillDefinition>? skills = null,
-        SkillsConfig? skillsConfig = null)
+        SkillsConfig? skillsConfig = null,
+        bool requireToolApproval = false,
+        IReadOnlyList<string>? approvalRequiredTools = null,
+        OpenClaw.Core.Approvals.IMetaApprovalStore? metaApprovals = null)
     {
         var serviceCollection = new ServiceCollection();
         if (routingPolicy is not null)
             serviceCollection.AddSingleton(routingPolicy);
+        // The MAF runtime resolves the approval store from the service provider, so injecting it
+        // here mirrors how the Gateway wires it in production.
+        if (metaApprovals is not null)
+            serviceCollection.AddSingleton(metaApprovals);
         var services = serviceCollection.BuildServiceProvider();
         var config = new GatewayConfig
         {
@@ -3810,8 +3920,8 @@ public sealed class MafAdapterTests
                 PluginSkillDirs = [],
                 Logger = NullLogger.Instance,
                 Hooks = [],
-                RequireToolApproval = false,
-                ApprovalRequiredTools = [],
+                RequireToolApproval = requireToolApproval,
+                ApprovalRequiredTools = approvalRequiredTools ?? [],
                 IsContractTokenBudgetExceeded = null,
                 IsContractRuntimeBudgetExceeded = null,
                 RecordContractTurnUsage = null,

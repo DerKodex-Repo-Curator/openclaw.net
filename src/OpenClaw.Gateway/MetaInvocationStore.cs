@@ -110,12 +110,96 @@ public sealed class MetaInvocationStore : IHostedService, IDisposable
         var current = records[index];
         if (current.Status == MetaInvocationStatus.Completed && current.Result == result)
             return;
-        if (current.Status != MetaInvocationStatus.Running)
-            throw new InvalidOperationException("Only a running meta invocation can be completed.");
+        if (current.Status is not (MetaInvocationStatus.Running or MetaInvocationStatus.AwaitingInput))
+            throw new InvalidOperationException("Only a running or paused meta invocation can be completed.");
 
-        records[index] = current with { Status = MetaInvocationStatus.Completed, Result = result, Error = null };
+        records[index] = current with
+        {
+            Status = MetaInvocationStatus.Completed,
+            Result = result,
+            Error = null,
+            Pause = null
+        };
         await SaveAsync(records, cancellationToken);
         ReleaseInvocationLease(current.InvocationId);
+    }
+
+    /// <summary>
+    /// Finishes an invocation with a terminal business failure (for example a denied approval).
+    /// The run did not produce a result, but it is not "uncertain" either.
+    /// </summary>
+    public async Task CompleteWithErrorAsync(
+        string callerId,
+        string idempotencyKey,
+        string errorCode,
+        CancellationToken cancellationToken)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(errorCode);
+
+        using var handle = await AcquireLockAsync(cancellationToken);
+        var records = await LoadAsync(cancellationToken);
+        var index = FindRecordIndex(records, callerId, idempotencyKey);
+        if (index < 0)
+            throw new InvalidOperationException("Meta invocation claim was not found.");
+
+        var current = records[index];
+        if (current.Status == MetaInvocationStatus.Completed && current.Error == errorCode)
+            return;
+        if (current.Status is not (MetaInvocationStatus.Running or MetaInvocationStatus.AwaitingInput))
+            throw new InvalidOperationException("Only a running or paused meta invocation can be completed.");
+
+        records[index] = current with
+        {
+            Status = MetaInvocationStatus.Completed,
+            Result = null,
+            Error = errorCode,
+            Pause = null
+        };
+        await SaveAsync(records, cancellationToken);
+        ReleaseInvocationLease(current.InvocationId);
+    }
+
+    /// <summary>
+    /// Records that the run stopped on a human-gated step and kept its durable checkpoint.
+    /// Repeating the same pause (same reason and step) is an idempotent no-op.
+    /// </summary>
+    public async Task<MetaInvocationRecord> MarkAwaitingInputAsync(
+        string callerId,
+        string idempotencyKey,
+        MetaInvocationPauseInfo pause,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(pause);
+        ArgumentException.ThrowIfNullOrWhiteSpace(pause.StepId);
+
+        using var handle = await AcquireLockAsync(cancellationToken);
+        var records = await LoadAsync(cancellationToken);
+        var index = FindRecordIndex(records, callerId, idempotencyKey);
+        if (index < 0)
+            throw new InvalidOperationException("Meta invocation claim was not found.");
+
+        var current = records[index];
+        if (current.Status == MetaInvocationStatus.Completed)
+            throw new InvalidOperationException("A completed meta invocation cannot pause.");
+        if (current.Status is not (MetaInvocationStatus.Running or MetaInvocationStatus.AwaitingInput))
+            throw new InvalidOperationException("Only a running or paused meta invocation can await input.");
+
+        var updated = current with
+        {
+            Status = MetaInvocationStatus.AwaitingInput,
+            Error = null,
+            Pause = pause
+        };
+        if (updated != current)
+        {
+            records[index] = updated;
+            await SaveAsync(records, cancellationToken);
+        }
+
+        // The run is not executing while it waits, so the execution lease must not block a
+        // later resume from another process.
+        ReleaseInvocationLease(current.InvocationId);
+        return updated;
     }
 
     public async Task MarkUncertainAsync(
@@ -135,12 +219,61 @@ public sealed class MetaInvocationStore : IHostedService, IDisposable
         var current = records[index];
         if (current.Status == MetaInvocationStatus.Uncertain && current.Error == error)
             return;
-        if (current.Status != MetaInvocationStatus.Running)
-            throw new InvalidOperationException("Only a running meta invocation can be marked uncertain.");
+        if (current.Status is not (MetaInvocationStatus.Running or MetaInvocationStatus.AwaitingInput))
+            throw new InvalidOperationException("Only a running or paused meta invocation can be marked uncertain.");
 
-        records[index] = current with { Status = MetaInvocationStatus.Uncertain, Error = error };
+        records[index] = current with
+        {
+            Status = MetaInvocationStatus.Uncertain,
+            Error = error,
+            Pause = null
+        };
         await SaveAsync(records, cancellationToken);
         ReleaseInvocationLease(current.InvocationId);
+    }
+
+    /// <summary>
+    /// Claims the right to resume a paused invocation. Returns null when the record is no
+    /// longer paused or another resume is already in flight, so a caller can never re-enter
+    /// the same run twice.
+    /// </summary>
+    public async Task<MetaInvocationRecord?> TryBeginResumeAsync(
+        string callerId,
+        string idempotencyKey,
+        CancellationToken cancellationToken)
+    {
+        using var handle = await AcquireLockAsync(cancellationToken);
+        var records = await LoadAsync(cancellationToken);
+        var index = FindRecordIndex(records, callerId, idempotencyKey);
+        if (index < 0)
+            return null;
+
+        var current = records[index];
+        if (current.Status != MetaInvocationStatus.AwaitingInput || _activeLeases.ContainsKey(current.InvocationId))
+            return null;
+
+        var lease = TryAcquireInvocationLease(current.InvocationId);
+        if (lease is null)
+            return null;
+        if (!_activeLeases.TryAdd(current.InvocationId, lease))
+        {
+            lease.Dispose();
+            return null;
+        }
+
+        return current;
+    }
+
+    /// <summary>Reads one ledger record without creating or mutating anything.</summary>
+    public async Task<MetaInvocationRecord?> TryGetAsync(
+        string callerId,
+        string idempotencyKey,
+        CancellationToken cancellationToken)
+    {
+        await using var handle = await AcquireLockAsync(cancellationToken);
+        var records = await LoadAsync(cancellationToken);
+        var index = FindRecordIndex(records, callerId, idempotencyKey);
+        return index < 0 ? null : records[index];
     }
 
     public async Task MarkInterruptedInvocationsUncertainAsync(CancellationToken cancellationToken)
@@ -238,7 +371,9 @@ public sealed class MetaInvocationStore : IHostedService, IDisposable
             string.IsNullOrWhiteSpace(record.RequestHash) ||
             record.InvocationId == Guid.Empty ||
             !Enum.IsDefined(record.Status) ||
-            (record.Status == MetaInvocationStatus.Completed && record.Result is null)) ||
+            (record.Status == MetaInvocationStatus.Completed && record.Result is null && record.Error is null) ||
+            (record.Status == MetaInvocationStatus.AwaitingInput && record.Pause is null) ||
+            (record.Status != MetaInvocationStatus.AwaitingInput && record.Pause is not null)) ||
             records.Select(record => (record.CallerId, record.IdempotencyKey)).Distinct().Count() != records.Count)
         {
             throw new InvalidDataException("Invalid meta invocation ledger records.");

@@ -65,7 +65,8 @@ internal sealed class IntegrationApiFacade
                 services.GetRequiredService<MetaInvocationStore>(),
                 runtime.SessionManager,
                 runtime.AgentRuntime,
-                services.GetRequiredService<ILogger<MetaInvocationService>>()),
+                services.GetRequiredService<ILogger<MetaInvocationService>>(),
+                services.GetService<OpenClaw.Core.Approvals.IMetaApprovalStore>()),
             services.GetService<IGoalService>());
     }
 
@@ -107,8 +108,9 @@ internal sealed class IntegrationApiFacade
         bool isAdmin,
         string idempotencyKey,
         MetaSkillInvocationRequest request,
-        CancellationToken cancellationToken)
-        => _metaInvocationService.InvokeAsync(callerId, accountId, isAdmin, idempotencyKey, request, cancellationToken);
+        CancellationToken cancellationToken,
+        MetaInvocationResumeRequest? resume = null)
+        => _metaInvocationService.InvokeAsync(callerId, accountId, isAdmin, idempotencyKey, request, cancellationToken, resume);
 
     public IntegrationStatusResponse BuildStatusResponse()
     {
