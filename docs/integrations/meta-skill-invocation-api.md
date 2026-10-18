@@ -182,6 +182,65 @@ Every meta-invocation response also carries `X-OpenClaw-Skill-Index` (`ready`, `
 `unready`), so a caller that was allowed to run against a degraded index can record why. `GET
 /health/ready` reports the same state in a `skills` section and returns `503` while unready.
 
+## MCP health (read-only)
+
+The gateway probes every configured MCP server with `tools/list` on an interval and turns the results
+into a small state machine. Two `GET` endpoints expose it, so a caller can tell "the skill is broken"
+from "one of its tools lives on a server that is down":
+
+```http
+GET /api/integration/mcp-health
+GET /api/integration/mcp-health/stream
+Authorization: Bearer <operator-token>
+# scope: integration.read
+```
+
+```json
+{
+  "generatedAtUtc": "2026-10-17T09:12:03Z",
+  "servers": [
+    { "id": "github", "state": "healthy", "lastProbeAtUtc": "2026-10-17T09:11:58Z", "lastSuccessAtUtc": "2026-10-17T09:11:58Z", "consecutiveFailures": 0, "latencyMs": 42, "toolCount": 27, "lastErrorCode": null },
+    { "id": "erp", "state": "degraded", "lastProbeAtUtc": "2026-10-17T09:11:59Z", "lastSuccessAtUtc": "2026-10-17T09:00:12Z", "consecutiveFailures": 2, "latencyMs": null, "toolCount": 8, "lastErrorCode": "timeout" }
+  ]
+}
+```
+
+| State | Meaning | Effect on tools |
+| --- | --- | --- |
+| `unknown` | Configured, not probed yet (startup, or just reloaded in). | Visible (optimistic). |
+| `healthy` | Last probe succeeded and the inventory matched the registered tools. | Visible. |
+| `degraded` | `FailureThreshold` (default 2) consecutive failures, or the tool inventory changed. | Visible; calls still go out. |
+| `down` | `DownThreshold` (default 5) consecutive failures. | Hidden from the model, and calls are refused with `mcp.server_unavailable` without reaching the network. |
+
+Recovery needs `RecoveryThreshold` (default 3) consecutive successes, so one lucky probe cannot flap
+tools in and out of the model's tool list. `latencyMs` is the duration of the last **successful** probe
+and is `null` while failing — a stale latency is worse than none.
+
+- `lastErrorCode` is a closed set — `timeout`, `transport`, `protocol`, `unauthorized`, `server_error`,
+  `tools_changed` — never raw exception text.
+- `GET .../stream` is server-sent events: one `event: mcp_health` frame per **state change**, with
+  `server`, `previousState`, `toolsChanged` and `occurredAtUtc`. A quiet stream means a quiet fleet;
+  comment frames (`: keepalive`) keep the connection alive and are not state changes.
+- A meta-invocation response carries `X-OpenClaw-Mcp-State: degraded` (or `down`) when some server is
+  not healthy, and no such header when the whole fleet is. It describes the fleet, not the servers a
+  particular run happened to touch.
+- Probing is disabled but the fleet is still listed as `unknown` when `Mcp.Health.Enabled` is `false`;
+  the stream then stays silent by design.
+- A server that never connected at startup is reported as `transport`, not omitted from the list —
+  a fleet view that silently loses a server is worse than one that shows a broken server.
+
+Configuration (`Mcp.Health`):
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `Enabled` | `true` | Whether the probe loop runs. Configured servers are still connected when it is off. |
+| `IntervalSeconds` | `30` | Gap between probe rounds. |
+| `ProbeTimeoutSeconds` | `5` | Per-probe timeout; exceeding it counts as `timeout`. |
+| `FailureThreshold` | `2` | Consecutive failures that make a server `degraded`. |
+| `DownThreshold` | `5` | Consecutive failures that make a server `down` (tools hidden, calls refused). |
+| `RecoveryThreshold` | `3` | Consecutive successes that bring a degraded or down server back. |
+| `HideUnhealthyTools` | `true` | Whether a `down` server's tools leave the model-facing tool list; calls are refused either way. |
+
 ## Idempotency and Recovery
 
 Invocation claims and terminal results are stored under the configured Gateway `Memory.StoragePath`. `Gateway.MetaInvocations.RetentionDays` controls how long completed and uncertain records are retained; it defaults to `30` days. A record's event journal is deleted together with the record, so an expired run does not leave an orphaned `meta-invocations/*.events.ndjson` behind. Set retention to at least the longest retry window of any caller, including the DrasiWake outbox, so an old retry cannot outlive its deduplication record.

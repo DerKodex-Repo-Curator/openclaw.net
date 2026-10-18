@@ -134,6 +134,38 @@ MCP App 条目使用 Gateway 签名凭据的示例：
 
 ---
 
+## MCP Server 健康监控
+
+每个已配置的 MCP server 都会按间隔被 `tools/list` 探测一次，探测结果决定它的工具是否提供给模型：
+
+```json
+{
+  "OpenClaw": {
+    "Plugins": {
+      "Mcp": {
+        "Health": {
+          "Enabled": true,
+          "IntervalSeconds": 30,
+          "ProbeTimeoutSeconds": 5,
+          "FailureThreshold": 2,
+          "DownThreshold": 5,
+          "RecoveryThreshold": 3,
+          "HideUnhealthyTools": true
+        }
+      }
+    }
+  }
+}
+```
+
+状态为 `unknown` → `healthy` ⇄ `degraded` → `down`。连续两次失败进入 `degraded`（工具仍可见，因为把模型已经围绕它制定计划的工具藏起来，比让它失败一次更糟）；连续五次失败进入 `down`，此时 `HideUnhealthyTools` 会把它从模型可见的工具表中移除，而仍然到达的调用直接返回 `mcp.server_unavailable`，不发到网络上。恢复需要连续三次成功，因此一次侥幸的探测无法让工具在提示里来回抖动。
+
+`tools/list` 结果变化会以 `tools_changed` 把该 server 降级并触发注册表重建，因此会话中途上线了新工具的 server 无需重启即可到达模型。
+
+`GET /api/integration/mcp-health` 返回整个集群，`.../stream` 在每次状态变化时推送一帧 `mcp_health`。两者都是只读，需要 `integration.read`；载荷结构与封闭错误码集合见[集成 API](integrations/meta-skill-invocation-api.md)。
+
+---
+
 ## 🏗 核心工具
 这些工具默认启用，但可通过 `Security` 和 `Tooling` 配置进行限制。
 

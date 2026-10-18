@@ -25,6 +25,7 @@ internal static partial class IntegrationEndpoints
         var facade = IntegrationApiFacade.Create(startup, runtime, app.Services);
         var group = app.MapGroup("/api/integration").WithTags("OpenClaw Integration");
         MapSkillIndexEndpoint(group, startup, runtime, browserSessions);
+        MapMcpHealthEndpoints(group, startup, runtime, browserSessions);
 
         group.MapPost("/meta-invocations", async (HttpContext ctx) =>
         {
@@ -93,6 +94,7 @@ internal static partial class IntegrationEndpoints
             // Reported on both the success and the refusal path: a caller needs to know which index
             // answered even when the answer is 503 skills.not_ready.
             AnnotateSkillIndex(ctx);
+            AnnotateMcpHealth(ctx);
 
             var outcome = await facade.InvokeMetaSkillAsync(
                 caller.AccountId ?? "bootstrap",

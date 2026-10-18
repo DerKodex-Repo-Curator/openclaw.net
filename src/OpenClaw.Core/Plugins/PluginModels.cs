@@ -172,6 +172,9 @@ public sealed class McpPluginsConfig
 {
     public bool Enabled { get; set; } = false;
     public Dictionary<string, McpServerConfig> Servers { get; set; } = new(StringComparer.Ordinal);
+
+    /// <summary>Probe loop settings; see <see cref="McpHealthConfig"/>.</summary>
+    public McpHealthConfig Health { get; set; } = new();
 }
 
 public sealed class McpServerConfig

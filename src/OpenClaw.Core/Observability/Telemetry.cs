@@ -50,4 +50,32 @@ public static class Telemetry
             observeFunc,
             description: "Number of pending tool approval requests");
     }
+
+    /// <summary>Duration of one MCP health probe, tagged by server id (design §8.3).</summary>
+    public static readonly Histogram<double> McpProbeDuration =
+        Meter.CreateHistogram<double>(
+            "openclaw.mcp.probe.duration",
+            unit: "ms",
+            description: "Duration of MCP health probes in milliseconds");
+
+    /// <summary>Failed MCP probes, tagged by server id and the closed reason code.</summary>
+    public static readonly Counter<long> McpProbeFailures =
+        Meter.CreateCounter<long>(
+            "openclaw.mcp.probe.failures",
+            description: "Number of failed MCP health probes, by server and reason");
+
+    /// <summary>
+    /// Reports each MCP server's state as 0=<c>unknown</c>, 1=<c>healthy</c>, 2=<c>degraded</c>,
+    /// 3=<c>down</c>, tagged by server id. Same shape as <see cref="RegisterApprovalQueueGauge"/>:
+    /// registered once during startup with a snapshot accessor.
+    /// </summary>
+    public static void RegisterMcpHealthGauge(Func<IReadOnlyList<Plugins.McpServerHealth>> snapshot)
+    {
+        Meter.CreateObservableGauge(
+            "openclaw.mcp.health.state",
+            () => snapshot().Select(health => new Measurement<long>(
+                Plugins.McpServerHealthStates.ToMetricValue(health.State),
+                new KeyValuePair<string, object?>("server", health.ServerId))),
+            description: "MCP server health (0 unknown, 1 healthy, 2 degraded, 3 down)");
+    }
 }

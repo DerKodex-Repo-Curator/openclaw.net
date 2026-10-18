@@ -4,6 +4,7 @@ using OpenClaw.Agent.Tools;
 using OpenClaw.Core.Abstractions;
 using OpenClaw.Core.Models;
 using OpenClaw.Core.Observability;
+using OpenClaw.Core.Plugins;
 using OpenClaw.Core.Skills;
 
 namespace OpenClaw.Agent;
@@ -47,6 +48,13 @@ public sealed class AgentRuntimeFactoryContext
     /// (tests, embedded hosts) the runtime keeps parsing directly.
     /// </summary>
     public SkillIndexCompiler? SkillIndexCompiler { get; init; }
+
+    /// <summary>
+    /// MCP server health as observed by the probe loop. When present, the executor hides the tools
+    /// of a <c>down</c> server and refuses calls to them; when absent (tests, embedded hosts) MCP
+    /// tools behave exactly as before.
+    /// </summary>
+    public McpServerHealthStore? McpHealthStore { get; init; }
 }
 
 public interface IAgentRuntimeFactory

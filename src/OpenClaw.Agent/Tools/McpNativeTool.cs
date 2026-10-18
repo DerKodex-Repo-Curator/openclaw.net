@@ -21,11 +21,18 @@ public sealed class McpNativeTool(
     string? endpointId = null,
     Uri? endpoint = null,
     IReadOnlyDictionary<string, string>? staticHeaders = null,
-    int requestTimeoutSeconds = 60) : IToolWithContext
+    int requestTimeoutSeconds = 60,
+    string? serverId = null) : IToolWithContext, IMcpServerBoundTool
 {
     public string Name => localName;
     public string Description => description;
     public string ParameterSchema => parameterSchema;
+
+    /// <summary>
+    /// The MCP server this tool came from, so the executor can refuse calls while that server is
+    /// down. Empty when the tool was built outside a registry (tests, custom hosts).
+    /// </summary>
+    public string McpServerId => serverId ?? string.Empty;
 
     public async ValueTask<string> ExecuteAsync(string argumentsJson, CancellationToken ct)
         => await ExecuteCoreAsync(argumentsJson, context: null, ct);

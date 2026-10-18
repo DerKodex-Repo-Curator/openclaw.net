@@ -96,6 +96,124 @@ public sealed class McpServerToolRegistry : IDisposable, IAsyncDisposable
         return _workspaceServers.TryGetValue(serverId, out var workspace) ? workspace.Client : null;
     }
 
+    /// <summary>
+    /// Every server the health probe loop should watch: configured servers that are enabled plus
+    /// workspace servers that are currently connected. A server with no client (it failed to
+    /// connect at startup) is still listed with <see cref="McpProbeTarget.Client"/> = null so the
+    /// monitor reports it as failing instead of silently forgetting it.
+    /// </summary>
+    public async Task<IReadOnlyList<McpProbeTarget>> GetProbeTargetsAsync(CancellationToken ct)
+    {
+        ThrowIfDisposed();
+        await _loadSemaphore.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            ThrowIfDisposed();
+
+            var targets = new List<McpProbeTarget>();
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+
+            if (_config.Enabled && _config.Servers is { } configured)
+            {
+                foreach (var (serverId, serverConfig) in configured)
+                {
+                    if (!serverConfig.Enabled || !seen.Add(serverId))
+                        continue;
+
+                    _clientsByServerId.TryGetValue(serverId, out var client);
+                    targets.Add(new McpProbeTarget(serverId, client, IsWorkspace: false));
+                }
+            }
+
+            foreach (var (serverId, state) in _workspaceServers)
+            {
+                if (seen.Add(serverId))
+                    targets.Add(new McpProbeTarget(serverId, state.Client, IsWorkspace: true));
+            }
+
+            return targets.OrderBy(static t => t.ServerId, StringComparer.Ordinal).ToArray();
+        }
+        finally
+        {
+            _loadSemaphore.Release();
+        }
+    }
+
+    /// <summary>
+    /// Re-lists one server's tools and reconciles the registry's tool table with the result.
+    /// </summary>
+    /// <remarks>
+    /// Used when a probe sees a tool inventory that differs from the one already registered
+    /// (T-B5-5): the caller applies the returned delta to the runtime so the model is offered the
+    /// tools that actually exist.
+    /// </remarks>
+    public async Task<McpWorkspaceReloadResult> RefreshServerToolsAsync(string serverId, CancellationToken ct)
+    {
+        ThrowIfDisposed();
+        await _loadSemaphore.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            ThrowIfDisposed();
+
+            McpClient client;
+            McpServerConfig serverConfig;
+            var isWorkspace = false;
+
+            if (_workspaceServers.TryGetValue(serverId, out var workspace))
+            {
+                client = workspace.Client;
+                serverConfig = workspace.Config;
+                isWorkspace = true;
+            }
+            else if (_clientsByServerId.TryGetValue(serverId, out var configuredClient) &&
+                     _config.Servers is { } servers &&
+                     servers.TryGetValue(serverId, out var configuredConfig))
+            {
+                client = configuredClient;
+                serverConfig = configuredConfig;
+            }
+            else
+            {
+                return new McpWorkspaceReloadResult([], []);
+            }
+
+            var displayName = string.IsNullOrWhiteSpace(serverConfig.Name) ? serverId : serverConfig.Name!;
+            var pluginId = $"mcp:{serverId}";
+            var descriptors = await LoadToolsFromClientAsync(client, serverId, pluginId, displayName, serverConfig, ct)
+                .ConfigureAwait(false);
+            var refreshed = descriptors
+                .Select(descriptor => CreateDiscoveredTool(
+                    client, descriptor, serverConfig, serverId, displayName, pluginId, useDelegation: !isWorkspace))
+                .ToList();
+
+            var existing = _tools.Where(tool => string.Equals(tool.PluginId, pluginId, StringComparison.Ordinal)).ToList();
+            var refreshedNames = refreshed.Select(tool => tool.Tool.Name).ToHashSet(StringComparer.Ordinal);
+            var existingNames = existing.Select(tool => tool.Tool.Name).ToHashSet(StringComparer.Ordinal);
+
+            var removed = new List<string>();
+            foreach (var stale in existing)
+            {
+                if (refreshedNames.Contains(stale.Tool.Name))
+                    continue;
+
+                _tools.Remove(stale);
+                removed.Add(stale.Tool.Name);
+            }
+
+            var added = refreshed.Where(tool => !existingNames.Contains(tool.Tool.Name)).ToList();
+            _tools.AddRange(added);
+
+            if (isWorkspace)
+                _workspaceServers[serverId] = (client, refreshed, serverConfig);
+
+            return new McpWorkspaceReloadResult([.. added.Select(tool => tool.Tool)], removed);
+        }
+        finally
+        {
+            _loadSemaphore.Release();
+        }
+    }
+
     public async Task<McpWorkspaceReloadResult> ReloadWorkspaceServersAsync(
         Dictionary<string, McpServerConfig>? newServers,
         CancellationToken ct)
@@ -155,10 +273,8 @@ public sealed class McpServerToolRegistry : IDisposable, IAsyncDisposable
                     var pluginId = $"mcp:{serverId}";
                     var descriptors = await LoadToolsFromClientAsync(client, serverId, pluginId, displayName, serverConfig, ct);
                     var discoveredTools = descriptors
-                        .Select(tool => new DiscoveredMcpTool(
-                            pluginId,
-                            new McpNativeTool(client, tool.LocalName, tool.RemoteName, tool.Description, tool.InputSchemaText, tool.HasUi),
-                            displayName))
+                        .Select(tool => CreateDiscoveredTool(
+                            client, tool, serverConfig, serverId, displayName, pluginId, useDelegation: false))
                         .ToList();
 
                     _workspaceServers[serverId] = (client, discoveredTools, CloneServerConfig(serverConfig));
@@ -226,26 +342,8 @@ public sealed class McpServerToolRegistry : IDisposable, IAsyncDisposable
                 _clientsByServerId[serverId] = client;
 
                 foreach (var tool in tools)
-                {
-                    discoveredTools.Add(new DiscoveredMcpTool(
-                        pluginId,
-                        new McpNativeTool(
-                            client,
-                            tool.LocalName,
-                            tool.RemoteName,
-                            tool.Description,
-                            tool.InputSchemaText,
-                            tool.HasUi,
-                            _delegatedToolInvoker,
-                            serverConfig.DelegatedCredentials,
-                            serverId,
-                            string.Equals(serverConfig.NormalizeTransport(), "http", StringComparison.Ordinal)
-                                ? new Uri(serverConfig.Url!)
-                                : null,
-                            ResolveHeaders(serverConfig.Headers),
-                            serverConfig.RequestTimeoutSeconds),
-                        displayName));
-                }
+                    discoveredTools.Add(CreateDiscoveredTool(
+                        client, tool, serverConfig, serverId, displayName, pluginId, useDelegation: true));
             }
 
             _clients.AddRange(discoveredClients);
@@ -320,6 +418,52 @@ public sealed class McpServerToolRegistry : IDisposable, IAsyncDisposable
         _logger.LogInformation("MCP server enabled: {ServerId} ({DisplayName}) with {ToolCount} tool(s)",
             serverId, displayName, tools.Count);
         return tools;
+    }
+
+    /// <summary>
+    /// Builds one native tool for a discovered descriptor.
+    /// </summary>
+    /// <param name="useDelegation">
+    /// Configured servers keep their delegated-credential and per-request timeout settings. Workspace
+    /// servers historically ignored both, so they keep that shape instead of silently changing how
+    /// they authenticate.
+    /// </param>
+    private DiscoveredMcpTool CreateDiscoveredTool(
+        McpClient client,
+        McpToolDescriptor descriptor,
+        McpServerConfig config,
+        string serverId,
+        string displayName,
+        string pluginId,
+        bool useDelegation)
+    {
+        var tool = useDelegation
+            ? new McpNativeTool(
+                client,
+                descriptor.LocalName,
+                descriptor.RemoteName,
+                descriptor.Description,
+                descriptor.InputSchemaText,
+                descriptor.HasUi,
+                _delegatedToolInvoker,
+                config.DelegatedCredentials,
+                serverId,
+                string.Equals(config.NormalizeTransport(), "http", StringComparison.Ordinal) && config.Url is not null
+                    ? new Uri(config.Url)
+                    : null,
+                ResolveHeaders(config.Headers),
+                config.RequestTimeoutSeconds,
+                serverId)
+            : new McpNativeTool(
+                client,
+                descriptor.LocalName,
+                descriptor.RemoteName,
+                descriptor.Description,
+                descriptor.InputSchemaText,
+                descriptor.HasUi,
+                serverId: serverId);
+
+        return new DiscoveredMcpTool(pluginId, tool, displayName);
     }
 
     private static string ResolveToolName(string serverId, string? toolNamePrefix, string remoteName)
@@ -610,10 +754,6 @@ public sealed class McpServerToolRegistry : IDisposable, IAsyncDisposable
 
     internal sealed record DiscoveredMcpTool(string PluginId, ITool Tool, string Detail);
 
-    public sealed record McpWorkspaceReloadResult(
-        IReadOnlyList<ITool> AddedTools,
-        IReadOnlyList<string> RemovedToolNames);
-
     private static McpServerConfig CloneServerConfig(McpServerConfig config)
         => new()
         {
@@ -685,3 +825,16 @@ public sealed class McpServerToolRegistry : IDisposable, IAsyncDisposable
     }
     private sealed record McpToolDescriptor(string LocalName, string RemoteName, string Description, string InputSchemaText, bool HasUi);
 }
+
+/// <summary>One server the health probe loop should watch.</summary>
+/// <param name="ServerId">Configured or workspace server id.</param>
+/// <param name="Client">Live client; <see langword="null"/> when the server never connected, which
+/// the monitor reports as a transport failure rather than dropping the server from the fleet.</param>
+/// <param name="IsWorkspace">Whether the server came from the workspace <c>mcp.json</c> rather than
+/// gateway configuration.</param>
+public sealed record McpProbeTarget(string ServerId, McpClient? Client, bool IsWorkspace);
+
+/// <summary>Tools a reconcile added and removed for one server.</summary>
+public sealed record McpWorkspaceReloadResult(
+    IReadOnlyList<ITool> AddedTools,
+    IReadOnlyList<string> RemovedToolNames);

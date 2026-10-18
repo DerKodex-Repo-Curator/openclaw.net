@@ -10,6 +10,7 @@ using OpenClaw.Core.Middleware;
 using OpenClaw.Core.Models;
 using OpenClaw.Core.Observability;
 using OpenClaw.Core.Pipeline;
+using OpenClaw.Core.Plugins;
 using OpenClaw.Core.Security;
 using OpenClaw.Core.Sessions;
 using OpenClaw.Core.Skills;
@@ -43,6 +44,42 @@ internal static partial class RuntimeInitializationExtensions
         app.Services.GetRequiredService<McpWatcherHolder>().Watcher = watcher;
         watcher.Start(app.Lifetime.ApplicationStopping);
         return watcher;
+    }
+
+    /// <summary>
+    /// Wires the MCP probe loop to the live tool table.
+    /// </summary>
+    /// <remarks>
+    /// The monitor cannot depend on <see cref="IAgentRuntime"/>: that runtime is built from the same
+    /// registry the monitor probes, so a constructor dependency would be a cycle. The callback is
+    /// installed here, where both sides already exist, and mirrors what a workspace reload does, so
+    /// a tool added or removed by a probe reaches the model the same way one added by an edit does.
+    /// </remarks>
+    private static void StartMcpHealthMonitor(WebApplication app, IAgentRuntime agentRuntime)
+    {
+        var store = app.Services.GetService<McpServerHealthStore>();
+        if (store is not null)
+            Telemetry.RegisterMcpHealthGauge(store.Snapshot);
+
+        var monitor = app.Services.GetService<McpServerHealthMonitor>();
+        if (monitor is null)
+            return;
+
+        var bindingCache = app.Services.GetService<CapabilityBindingCache>();
+
+        monitor.ToolsChanged = async (target, delta, ct) =>
+        {
+            await agentRuntime.ApplyMcpToolChangesAsync(delta.AddedTools, delta.RemovedToolNames, ct)
+                .ConfigureAwait(false);
+            bindingCache?.Clear();
+            await agentRuntime.ClearCapabilitySlotRuntimeCacheAsync(ct).ConfigureAwait(false);
+            app.Logger.LogInformation(
+                "MCP server '{ServerId}' ({Kind}) tool inventory applied to the runtime (+{Added} / -{Removed}).",
+                target.ServerId,
+                target.IsWorkspace ? "workspace" : "configured",
+                delta.AddedTools.Count,
+                delta.RemovedToolNames.Count);
+        };
     }
 
     private static GatewayAppRuntime CreateGatewayRuntime(
@@ -368,6 +405,7 @@ internal static partial class RuntimeInitializationExtensions
             RequireToolApproval = requireToolApproval,
             ApprovalRequiredTools = approvalRequiredTools,
             SkillIndexCompiler = services.GetService<SkillIndexCompiler>(),
+            McpHealthStore = services.GetService<McpServerHealthStore>(),
             TurnTokenUsageObserver = services.GetService<ITurnTokenUsageObserver>(),
             ToolSandbox = toolSandbox,
             ToolGovernance = services.GetRequiredService<IToolGovernanceService>(),

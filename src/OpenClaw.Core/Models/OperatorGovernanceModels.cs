@@ -191,6 +191,13 @@ public static class ToolFailureCodes
     public const string BrowserBackendMissing = "browser_backend_missing";
     public const string Timeout = "timeout";
     public const string ToolFailed = "tool_failed";
+
+    /// <summary>
+    /// The MCP server that owns this tool is <c>down</c>, so the call was refused before it reached
+    /// the wire. Distinct from <see cref="ToolFailed"/>: nothing was attempted, and retrying against
+    /// a healthy server may well succeed (design §8.1).
+    /// </summary>
+    public const string McpServerUnavailable = "mcp.server_unavailable";
 }
 
 public sealed class BrowserToolCapabilitySummary

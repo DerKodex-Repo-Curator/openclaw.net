@@ -310,10 +310,26 @@ public sealed class CoreServicesExtensionsTests
             await using var provider = services.BuildServiceProvider();
 
             var backfillService = provider.GetRequiredService<SqliteEmbeddingBackfillService>();
-            var hostedDescriptor = services.Last(static descriptor => descriptor.ServiceType == typeof(IHostedService));
-            var hostedService = Assert.IsAssignableFrom<IHostedService>(hostedDescriptor.ImplementationFactory!(provider));
 
-            Assert.Same(backfillService, hostedService);
+            // Assert membership, not position: the container now registers several hosted services
+            // (pulse, retention, cron startup, shutdown coordinator, prompt cache, skill index), so
+            // "the last descriptor" is an accident of registration order, not a contract. Some of
+            // those need collaborators this minimal container does not register, so building them
+            // is best-effort; the backfill service's own dependencies are all present.
+            var hosted = new List<IHostedService>();
+            foreach (var descriptor in services.Where(static descriptor => descriptor.ServiceType == typeof(IHostedService)))
+            {
+                try
+                {
+                    if (descriptor.ImplementationFactory?.Invoke(provider) is IHostedService service)
+                        hosted.Add(service);
+                }
+                catch (InvalidOperationException)
+                {
+                }
+            }
+
+            Assert.Contains(hosted, service => ReferenceEquals(service, backfillService));
         }
         finally
         {

@@ -140,27 +140,15 @@ internal static partial class RuntimeInitializationExtensions
             resolveLogger);
 
         var combinedPluginSkillRoots = CollectPluginSkillRoots(pluginComposition);
-
-        // B4: one authoritative compile, performed before the runtime exists. Everything downstream -
-        // the runtime factory, the artifact runtime, the probes and every endpoint - reads this same
-        // snapshot, so there is no window where the runtime has new skills and the index reports old
-        // ones (design §7.2). The hosted-service compile in SkillIndexCompiler sees Version > 0 and
-        // skips its own pass.
-        var skillIndexCompiler = app.Services.GetService<SkillIndexCompiler>();
-        var skillIndex = SkillIndexSnapshot.Empty;
-        if (skillIndexCompiler is not null)
-        {
-            skillIndexCompiler.Configure(resolvedRuntimeWorkspacePath, combinedPluginSkillRoots);
-            skillIndex = await skillIndexCompiler.CompileAsync(SkillIndexCompileTrigger.Startup);
-        }
-
-        var skillLogger = loggerFactory.CreateLogger("SkillLoader");
-        IReadOnlyList<SkillDefinition> skills = skillIndexCompiler is not null
-            ? skillIndex.Skills
-            : SkillLoader.LoadAll(config.Skills, resolvedRuntimeWorkspacePath, skillLogger, combinedPluginSkillRoots);
+        var (skillIndexCompiler, skills) = await CompileStartupSkillsAsync(
+            app.Services,
+            config,
+            resolvedRuntimeWorkspacePath,
+            combinedPluginSkillRoots,
+            artifactRuntime,
+            loggerFactory);
         if (skills.Count > 0)
-            skillLogger.LogInformation("{Summary}", SkillPromptBuilder.BuildSummary(skills));
-        artifactRuntime.ReplaceSkills(skills);
+            loggerFactory.CreateLogger("SkillLoader").LogInformation("{Summary}", SkillPromptBuilder.BuildSummary(skills));
         IAgentRuntime? runtimeForLoadSkill = null;
         Func<IReadOnlyList<SkillDefinition>> skillsProvider = () => runtimeForLoadSkill?.LoadedSkills ?? skills;
         tools =
@@ -231,6 +219,7 @@ internal static partial class RuntimeInitializationExtensions
             skillIndexCompiler);
         skillWatcher.Start(app.Lifetime.ApplicationStopping);
         var mcpWatcher = StartMcpWorkspaceWatcher(app, services, startup, agentRuntime);
+        StartMcpHealthMonitor(app, agentRuntime);
         var capabilitySources = app.Services.GetServices<OpenClaw.Core.Skills.Meta.ICapabilityChangeSource>().ToArray();
         foreach (var source in capabilitySources)
             await source.StartAsync(app.Lifetime.ApplicationStopping);
@@ -270,26 +259,7 @@ internal static partial class RuntimeInitializationExtensions
             pluginComposition.NativeDynamicPluginHost);
 
         await profile.OnRuntimeInitializedAsync(app, startup, runtime);
-        if (config.Tailscale.Enabled)
-        {
-            var tailscale = new Integrations.TailscaleService(
-                config.Tailscale,
-                config.Port,
-                loggerFactory.CreateLogger<Integrations.TailscaleService>());
-            shutdownCoordinator.RegisterAsyncCleanup("tailscale serve/funnel", _ => tailscale.DisposeAsync());
-            await tailscale.StartAsync(app.Lifetime.ApplicationStopping);
-        }
-
-        if (config.Mdns.Enabled)
-        {
-            var mdns = new Integrations.MdnsDiscoveryService(
-                config.Mdns,
-                config.Port,
-                authRequired: !string.IsNullOrWhiteSpace(config.AuthToken),
-                loggerFactory.CreateLogger<Integrations.MdnsDiscoveryService>());
-            shutdownCoordinator.RegisterAsyncCleanup("mDNS discovery", _ => mdns.DisposeAsync());
-            mdns.Start(app.Lifetime.ApplicationStopping);
-        }
+        await StartAuxiliaryServicesAsync(app, config, loggerFactory, shutdownCoordinator);
 
         return runtime;
     }

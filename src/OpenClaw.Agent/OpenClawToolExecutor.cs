@@ -13,6 +13,7 @@ using OpenClaw.Core.Governance;
 using OpenClaw.Core.Models;
 using OpenClaw.Core.Observability;
 using OpenClaw.Core.Pipeline;
+using OpenClaw.Core.Plugins;
 using OpenClaw.Core.Security;
 using OpenClaw.Core.Skills;
 
@@ -66,6 +67,7 @@ public sealed class OpenClawToolExecutor
     private readonly Func<Session, string, string?, CancellationToken, Task<string>>? _metaInvokeExecutor;
     private readonly Func<Session, string, string?, CancellationToken, McpCallerCredentialContext?, Task<string>>? _contextualMetaInvokeExecutor;
     private readonly IMetaApprovalStore? _metaApprovals;
+    private readonly McpServerHealthStore? _mcpHealth;
 
     public OpenClawToolExecutor(
         IReadOnlyList<ITool> tools,
@@ -88,7 +90,8 @@ public sealed class OpenClawToolExecutor
         Func<Session, string, string?, CancellationToken, Task<string>>? metaInvokeExecutor = null,
         IReadOnlyList<IToolResultInterceptor>? interceptors = null,
         Func<Session, string, string?, CancellationToken, McpCallerCredentialContext?, Task<string>>? contextualMetaInvokeExecutor = null,
-        IMetaApprovalStore? metaApprovals = null)
+        IMetaApprovalStore? metaApprovals = null,
+        McpServerHealthStore? mcpHealth = null)
     {
         _toolsByName = tools.ToDictionary(t => t.Name, StringComparer.Ordinal);
         _toolDeclarations = tools.Select(CreateDeclaration).Cast<AITool>().ToArray();
@@ -123,6 +126,7 @@ public sealed class OpenClawToolExecutor
         _metaInvokeExecutor = metaInvokeExecutor;
         _contextualMetaInvokeExecutor = contextualMetaInvokeExecutor;
         _interceptors = interceptors;
+        _mcpHealth = mcpHealth;
     }
 
     public AudienceProfile? GetAudienceProfile(Session session) => AudiencePolicy.Resolve(_config.Tooling.Audiences, session);
@@ -171,16 +175,51 @@ public sealed class OpenClawToolExecutor
     {
         AITool[] declarations;
         string[] toolNames;
+        HashSet<string>? hidden;
         lock (_toolsMutationLock)
         {
             declarations = _toolDeclarations.ToArray();
             toolNames = _toolsByName.Keys.ToArray();
+            hidden = HiddenUnavailableMcpToolsLocked();
         }
 
         var preset = _toolPresetResolver?.Resolve(session, toolNames);
         return declarations
+            .Where(item => hidden is null || !hidden.Contains(item.Name))
             .Where(item => IsToolAllowedForSession(session, item.Name, preset))
             .ToArray();
+    }
+
+    /// <summary>
+    /// MCP tools whose server is <c>down</c> (design §8.1). Hiding them is what makes an outage
+    /// legible to the model: it cannot call what it cannot see, so it plans around the gap instead
+    /// of burning turns on refusals. Must be called while holding <see cref="_toolsMutationLock"/>.
+    /// </summary>
+    private HashSet<string>? HiddenUnavailableMcpToolsLocked()
+    {
+        if (_mcpHealth is null || !_mcpHealth.Config.HideUnhealthyTools)
+            return null;
+
+        // One snapshot instead of one store lock per tool: a session can hold dozens of MCP tools
+        // and this runs on every turn.
+        HashSet<string>? down = null;
+        foreach (var health in _mcpHealth.Snapshot())
+        {
+            if (health.State == McpServerHealthState.Down)
+                (down ??= new HashSet<string>(StringComparer.Ordinal)).Add(health.ServerId);
+        }
+
+        if (down is null)
+            return null;
+
+        HashSet<string>? hidden = null;
+        foreach (var (name, tool) in _toolsByName)
+        {
+            if (tool is IMcpServerBoundTool { McpServerId.Length: > 0 } bound && down.Contains(bound.McpServerId))
+                (hidden ??= new HashSet<string>(StringComparer.Ordinal)).Add(name);
+        }
+
+        return hidden;
     }
 
     public bool SupportsStreaming(string toolName)
@@ -280,6 +319,31 @@ public sealed class OpenClawToolExecutor
                 failureCode: ToolFailureCodes.ToolFailed,
                 failureMessage: "Unknown tool.",
                 nextStep: "Use one of the tools declared for this session.");
+        }
+
+        // Declarations already hide a down server's tools, but a turn that started before the
+        // transition still holds the old list. Refusing here keeps the call off the wire and gives
+        // the model a code it can act on instead of a transport timeout (design §8.1).
+        if (tool is IMcpServerBoundTool { McpServerId.Length: > 0 } mcpBound &&
+            _mcpHealth is not null &&
+            !_mcpHealth.IsAvailable(mcpBound.McpServerId))
+        {
+            var refusal = $"Error: MCP server '{mcpBound.McpServerId}' is down; tool '{toolName}' was not called.";
+            _logger?.LogWarning(
+                "[{CorrelationId}] Refused tool '{ToolName}': MCP server '{ServerId}' is down.",
+                turnCtx.CorrelationId,
+                toolName,
+                mcpBound.McpServerId);
+
+            return CreateImmediateResult(
+                toolName,
+                persistedArgsJson,
+                refusal,
+                callId: callId,
+                resultStatus: ToolResultStatuses.Failed,
+                failureCode: ToolFailureCodes.McpServerUnavailable,
+                failureMessage: "The MCP server that provides this tool is down.",
+                nextStep: "Continue without this tool, or retry once the MCP server recovers.");
         }
 
         if (session.RouteToolsDisabled)

@@ -135,6 +135,48 @@ When using `gateway_signed`, the downstream MCP service (for example, Strategos)
 
 ---
 
+## MCP Server Health
+
+Every configured MCP server is probed with `tools/list` on an interval, and the result drives whether
+its tools are offered to the model:
+
+```json
+{
+  "OpenClaw": {
+    "Plugins": {
+      "Mcp": {
+        "Health": {
+          "Enabled": true,
+          "IntervalSeconds": 30,
+          "ProbeTimeoutSeconds": 5,
+          "FailureThreshold": 2,
+          "DownThreshold": 5,
+          "RecoveryThreshold": 3,
+          "HideUnhealthyTools": true
+        }
+      }
+    }
+  }
+}
+```
+
+The states are `unknown` → `healthy` ⇄ `degraded` → `down`. Two consecutive failures degrade a server
+(its tools stay visible, because hiding a tool the model already planned around is worse than one
+failed call); five take it down, at which point `HideUnhealthyTools` removes the tools from the
+model-facing list and any call that still arrives is refused with `mcp.server_unavailable` without
+touching the network. Recovery needs three consecutive successes, so a single lucky probe cannot make
+tools flap in and out of the prompt.
+
+A changed `tools/list` result degrades the server with `tools_changed` and reindexes the registry, so a
+server that ships a new tool mid-session reaches the model without a restart.
+
+`GET /api/integration/mcp-health` returns the fleet, and `.../stream` pushes one `mcp_health` frame per
+state change. Both are read-only and take `integration.read`; see
+[the integration API](integrations/meta-skill-invocation-api.md#mcp-health-read-only) for the payload
+and the closed error-code set.
+
+---
+
 ## 🏗 Core Tools
 These tools are enabled by default but can be restricted via `Security` and `Tooling` configurations.
 

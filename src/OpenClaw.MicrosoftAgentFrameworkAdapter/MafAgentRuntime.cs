@@ -18,6 +18,7 @@ using OpenClaw.Core.Approvals;
 using OpenClaw.Core.Models;
 using OpenClaw.Core.Models.Goal;
 using OpenClaw.Core.Observability;
+using OpenClaw.Core.Plugins;
 using OpenClaw.Core.Services;
 using OpenClaw.Core.Security;
 using OpenClaw.Core.Skills;
@@ -98,7 +99,8 @@ public sealed class MafAgentRuntime : IAgentRuntime
             toolGovernance: context.ToolGovernance,
             interceptors: context.Interceptors,
             contextualMetaInvokeExecutor: (session, skillName, input, token, callerContext) => ExecuteMetaSkillWithCallerContextAsync(session, skillName, input, token, callerContext),
-            metaApprovals: context.Services.GetService(typeof(IMetaApprovalStore)) as IMetaApprovalStore);
+            metaApprovals: context.Services.GetService(typeof(IMetaApprovalStore)) as IMetaApprovalStore,
+            mcpHealth: context.McpHealthStore);
         _options = options;
         _agentFactory = agentFactory;
         _sessionStateStore = sessionStateStore;

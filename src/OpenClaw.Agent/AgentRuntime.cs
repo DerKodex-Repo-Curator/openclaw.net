@@ -15,6 +15,7 @@ using OpenClaw.Core.Approvals;
 using OpenClaw.Core.Memory;
 using OpenClaw.Core.Models;
 using OpenClaw.Core.Observability;
+using OpenClaw.Core.Plugins;
 using OpenClaw.Core.Security;
 using OpenClaw.Core.Skills;
 using OpenClaw.Core.Skills.Meta;
@@ -129,7 +130,8 @@ public sealed class AgentRuntime : IAgentRuntime
         IReadOnlyList<IToolResultInterceptor>? interceptors = null,
         CapabilitySlotExecutor? capabilitySlotExecutor = null,
         IMetaApprovalStore? metaApprovals = null,
-        SkillIndexCompiler? skillIndexCompiler = null)
+        SkillIndexCompiler? skillIndexCompiler = null,
+        McpServerHealthStore? mcpHealthStore = null)
     {
         _logger = logger;
         _capabilitySlotExecutor = capabilitySlotExecutor;
@@ -184,7 +186,8 @@ public sealed class AgentRuntime : IAgentRuntime
             auditLog: toolAuditLog,
             interceptors: interceptors,
             contextualMetaInvokeExecutor: (session, skillName, input, token, callerContext) => ExecuteMetaSkillWithCallerContextAsync(session, skillName, input, token, callerContext),
-            metaApprovals: metaApprovals);
+            metaApprovals: metaApprovals,
+            mcpHealth: mcpHealthStore);
         _sessionTokenBudget = sessionTokenBudget;
         _estimateTokenBudgetAdmission = gatewayConfig?.EnableEstimatedTokenAdmissionControl ?? false;
         _fractalMemory = gatewayConfig?.Memory.Fractal;

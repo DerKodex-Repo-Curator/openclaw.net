@@ -1,6 +1,7 @@
 using OpenClaw.Agent.Plugins;
 using OpenClaw.Agent.Tools;
 using OpenClaw.Core.Models;
+using OpenClaw.Core.Plugins;
 using OpenClaw.Core.Security;
 using OpenClaw.Gateway.Bootstrap;
 using OpenClaw.Gateway.Mcp;
@@ -45,6 +46,18 @@ internal static class ToolServicesExtensions
                 sp.GetRequiredService<IMcpDelegatedToolInvoker>()));
         services.AddSingleton<McpDelegatedHttpClientFactory>();
         services.AddTransient<IMcpDelegatedToolInvoker, McpDelegatedToolInvoker>();
+
+        // MCP health (B5). The store is the single source of truth: the probe loop writes it, the
+        // executor and the integration endpoints read it. Registered unconditionally so the
+        // endpoint answers "empty fleet" rather than 404 when nothing is configured.
+        services.AddSingleton(sp => new McpServerHealthStore(startup.Config.Plugins.Mcp.Health));
+        services.AddSingleton<IMcpHealthProbe, McpClientHealthProbe>();
+        services.AddSingleton(sp => new McpServerHealthMonitor(
+            sp.GetRequiredService<McpServerToolRegistry>(),
+            sp.GetRequiredService<McpServerHealthStore>(),
+            sp.GetRequiredService<IMcpHealthProbe>(),
+            sp.GetRequiredService<ILoggerFactory>().CreateLogger<McpServerHealthMonitor>()));
+        services.AddHostedService(sp => sp.GetRequiredService<McpServerHealthMonitor>());
 
         services.AddSingleton<CapabilityBindingCache>();
         services.AddSingleton<ICapabilityInvalidationSink>(sp => sp.GetRequiredService<CapabilityBindingCache>());
