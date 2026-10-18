@@ -26,6 +26,7 @@ internal static partial class IntegrationEndpoints
         var group = app.MapGroup("/api/integration").WithTags("OpenClaw Integration");
         MapSkillIndexEndpoint(group, startup, runtime, browserSessions);
         MapMcpHealthEndpoints(group, startup, runtime, browserSessions);
+        MapInboxIngestEndpoint(group, startup, runtime, browserSessions);
 
         group.MapPost("/meta-invocations", async (HttpContext ctx) =>
         {

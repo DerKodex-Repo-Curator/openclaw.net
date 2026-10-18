@@ -14,7 +14,8 @@ internal static class SecurityServicesExtensions
     {
         services.AddSingleton(sp => new MetaInvocationStore(
             startup.Config.Memory.StoragePath,
-            startup.Config.MetaInvocations.RetentionDays));
+            startup.Config.MetaInvocations.RetentionDays,
+            sp.GetService<Inbox.IInboxRunEventSink>()));
         services.AddHostedService(sp => sp.GetRequiredService<MetaInvocationStore>());
         // The meta approval channel is opt-in: without the switch a gated tool is auto-denied.
         if (startup.Config.Integration.MetaApprovals.Enabled)

@@ -147,6 +147,35 @@ public sealed class MetaRunEventLog
         return new MetaRunEventReadResult(events, unreadable);
     }
 
+    /// <summary>
+    /// Every invocation that still has a journal on disk, newest file first.
+    /// </summary>
+    /// <remarks>
+    /// Exists so a projection rebuild can walk the journals themselves instead of paging the ledger:
+    /// the journal is the record of what happened, and the set of journals is exactly the set of runs
+    /// a rebuild has to replay. A file whose name is not an invocation id is ignored rather than
+    /// guessed at.
+    /// </remarks>
+    public IReadOnlyList<Guid> EnumerateInvocations()
+    {
+        if (!Directory.Exists(_directory))
+            return [];
+
+        var invocations = new List<Guid>();
+        foreach (var path in Directory.EnumerateFiles(_directory, "*.events.ndjson"))
+        {
+            var name = Path.GetFileName(path);
+            var suffix = ".events.ndjson";
+            if (name.Length <= suffix.Length || !name.EndsWith(suffix, StringComparison.Ordinal))
+                continue;
+
+            if (Guid.TryParseExact(name[..^suffix.Length], "N", out var invocationId))
+                invocations.Add(invocationId);
+        }
+
+        return invocations;
+    }
+
     /// <summary>Removes the journal of a run whose ledger record was just dropped by retention.</summary>
     public bool Delete(Guid invocationId)
     {

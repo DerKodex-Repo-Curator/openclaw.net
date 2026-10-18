@@ -241,6 +241,168 @@ Configuration (`Mcp.Health`):
 | `RecoveryThreshold` | `3` | Consecutive successes that bring a degraded or down server back. |
 | `HideUnhealthyTools` | `true` | Whether a `down` server's tools leave the model-facing tool list; calls are refused either way. |
 
+## Inbox (durable todos)
+
+A notification may be lost; a todo may not. The inbox is the durable counterpart of the notification
+path: DrasiWake's `inbox` channel posts to `POST /api/integration/inbox/items`, and every other item is
+a projection of something the gateway already knows (a parked run, a decided approval, a down server,
+a degraded index). Nothing else here can create an item, so a noisy notification category cannot drown
+the todo list — that decision belongs to the sender's channel filter.
+
+```http
+GET  /api/inbox?state=&kind=&cursor=&limit=
+GET  /api/inbox/stream
+POST /api/inbox/{id}/ack
+POST /api/inbox/{id}/snooze    {"untilUtc":"2026-10-18T09:00:00Z"}
+POST /api/inbox/{id}/resolve   {"resolutionCode":"resolved"}
+POST /api/admin/inbox/rebuild
+Authorization: Bearer <operator-token>
+```
+
+| Endpoint | Scope | Behaviour |
+| --- | --- | --- |
+| `GET /api/inbox` | `inbox.read` | Keyset page, newest first, over the item's `createdAtUtc` and `id`. `state` accepts `Open`, `Acknowledged`, `Resolved`, `Expired` (any casing) or `active` for the two live ones; `kind` narrows to one kind; `limit` defaults to `50` and caps at `OpenClaw:Inbox:MaxPageSize`. Pass `nextCursor` back as `cursor`; a malformed cursor answers `400 inbox.bad_request`. |
+| `POST /api/inbox/{id}/ack` | `inbox.mutate` | `Open → Acknowledged`. Acknowledging is about the operator's attention, not the resource: it never closes the item and never changes what is actually wrong. Repeating it is a no-op that returns `200` with the item unchanged. |
+| `POST /api/inbox/{id}/snooze` | `inbox.mutate` | `{untilUtc}` moves the item back to `Open` with a deadline; the sweep re-opens it when the deadline passes. A target that is not in the future answers `400 inbox.snooze_in_past`. |
+| `POST /api/inbox/{id}/resolve` | `inbox.mutate` | Human close. Only for `notification` items; every other kind is closed by its resource, so it answers `409 inbox.resource_driven`. An empty body means `{"resolutionCode":"resolved"}`. |
+| `GET /api/inbox/stream` | `inbox.read` | Server-sent events, one `event: inbox_item` frame per change (see below). |
+| `POST /api/admin/inbox/rebuild` | `admin.inbox.rebuild` | Recomputes the projection from the journals and returns `{items, eventsRead, skipped}`. Idempotent: a rebuild on a converged gateway changes nothing, and an operator's ack or snooze is carried over by item id. |
+| `POST /api/integration/inbox/items` | `integration.mutate.inbox` | The ingest above; the sender needs no read access to the list. |
+
+### Kinds
+
+`kind` is a closed set. It decides the title an operator reads and who owns the close — nothing else.
+
+| Kind | Severity | Default TTL | Closed by |
+| --- | --- | --- | --- |
+| `approval` | `Warning` | 7d | The approval decision (`approved` / `rejected`). |
+| `run_paused` | `Info` | 7d | The run resuming, completing or failing (`auto_closed`). Opening an `approval` for the same run closes it immediately — one blockage, one todo. |
+| `run_failed` | `Critical` | 7d | Nothing; it expires, because a run that already ended cannot be "fixed". |
+| `mcp_down` | `Critical` | 1d | The server recovering (`recovered`). |
+| `skill_degraded` | `Warning` | 1d | The index compiling cleanly again (`recovered`). |
+| `notification` | from the envelope | 7d | A person (`resolved`). The only human-closable kind. |
+
+Severity only ever rises while an item is open: a second, more alarming event for the same resource
+raises the label but never lowers it, and never mints a second item. Two active items describing the
+same resource are one item, whatever the event count.
+
+### States
+
+```
+Open ──ack──▶ Acknowledged ──(the resource changed)──▶ Resolved
+ │                  │
+ │                  └──snooze(until)──▶ Open        (the sweep brings it back)
+ └──(TTL passed)──▶ Expired
+```
+
+`Resolved` and `Expired` are terminal and never move again. **Automatic closure wins**: a decided
+approval, a run that reached a terminal state, a recovered server or a repaired index closes its item
+without waiting for a human, because an item that outlives its cause teaches operators to ignore the
+list. A human `ack` does not change the underlying state at all — that asymmetry is the point: "I have
+seen it" is not "it is over".
+
+`resolutionCode` is a closed set: `approved`, `rejected`, `completed`, `failed`, `recovered`,
+`auto_closed`, `resolved`, `expired`.
+
+### Reading the list
+
+```json
+{
+  "items": [
+    {
+      "id": "ib_5f0c1d9a7b3e4c62a8d10f4b",
+      "kind": "run_paused",
+      "severity": "Info",
+      "title": "Run is waiting for input",
+      "subject": { "invocationId": "3a1d3589-2856-4f6b-b572-9f9e060db134", "stepId": "review", "resourceKey": "run:3a1d3589-…" },
+      "createdAtUtc": "2026-10-17T09:12:03Z",
+      "updatedAtUtc": "2026-10-17T09:12:03Z",
+      "state": "Open",
+      "snoozeUntilUtc": null,
+      "resolvedAtUtc": null,
+      "resolutionCode": null,
+      "expiresAtUtc": "2026-10-24T09:12:03Z"
+    }
+  ],
+  "nextCursor": "1762000000000:ib_5f0c1d9a7b3e4c62a8d10f4b",
+  "counts": { "open": 1, "acknowledged": 0, "total": 1 }
+}
+```
+
+`counts` covers the caller's whole inbox, not the page, so a badge does not have to page through it.
+`subject` holds identifiers only — an invocation, approval, session, server or step id. No prompt text,
+no step input, no model output: an item is safe to show on a wall display and safe to log.
+
+### Stream
+
+```
+event: inbox_item
+id: 41
+data: {"seq":41,"change":"opened","item":{ … }}
+
+event: inbox_gap
+data: {"lastSeq":57}
+```
+
+`change` is `opened`, `updated`, `resolved` or `expired`. `id` is the sequence, monotonic per process;
+reconnect with `Last-Event-ID` and you receive exactly the frames you missed, with no repeat. The
+replay ring is deliberately small: when a client fell too far behind, the server sends one
+`event: inbox_gap` frame with the current `lastSeq` and expects the client to refetch
+`GET /api/inbox` rather than pretend a partial replay was complete. `: keepalive` comments keep an idle
+connection alive and are not changes.
+
+### Ingesting a notification
+
+```http
+POST /api/integration/inbox/items
+Content-Type: application/json
+
+{
+  "schemaVersion": 2,
+  "id": "ntf_9a1c2f",
+  "category": "approval.pending",
+  "severity": "Warning",
+  "subjectStableId": "run:3a1d3589",
+  "resource": { "kind": "invocation", "id": "3a1d3589" },
+  "message": "A tool step is waiting for approval.",
+  "attributes": { "stepId": "charge" },
+  "occurredAtUtc": "2026-10-17T09:12:03Z",
+  "dedupeKey": "approval:map_9f2c41d7a8b3"
+}
+```
+
+The envelope's `id` is the de-duplication key, so the sender's retry schedule (the same
+`Idempotency-Key` on every attempt) collapses onto one item instead of a new todo per attempt. Only
+`schemaVersion: 2` envelopes are accepted — a v1 body is `400 inbox.bad_request`, because a v1 payload
+has no category and no stable id to correlate on. Of the `attributes` bag only `stepId` is kept: it is
+the one field an operator can click through, and storing the rest would put sender-controlled text in a
+durable store. The response is the stored item.
+
+### Errors
+
+| Status | Code | Meaning |
+| --- | --- | --- |
+| `404` | `inbox.disabled` | `OpenClaw:Inbox:Enabled` is `false`; no surface is mounted. |
+| `404` | `inbox.not_found` | Unknown item id. |
+| `400` | `inbox.bad_request` | Malformed body, cursor or query. |
+| `400` | `inbox.snooze_in_past` | `untilUtc` is not in the future. |
+| `409` | `inbox.invalid_state` | The item is already terminal, so the mutation cannot apply. |
+| `409` | `inbox.resource_driven` | A human tried to resolve an item whose resource owns the close. |
+
+Configuration (`OpenClaw:Inbox`):
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `Enabled` | `true` | Mounts the whole surface; `false` makes every endpoint answer `404 inbox.disabled` and stops the projection. |
+| `SweepInterval` | `00:00:30` | How often expired items and elapsed snoozes are applied. |
+| `Ttl` | per kind (see the table above) | Per-kind TTL overrides, e.g. `Ttl:run_failed: 3.00:00:00`. |
+| `MaxPageSize` | `200` | Upper bound on one list page. |
+
+The projection lives in `{Memory.StoragePath}/inbox/items.ndjson`, one line per transition, compacted
+on load. It holds no user content, and it is rebuildable from the run journals — which is also why
+`rebuild` exists: a projection you cannot recompute is a second source of truth, and the first one to
+rot.
+
 ## Idempotency and Recovery
 
 Invocation claims and terminal results are stored under the configured Gateway `Memory.StoragePath`. `Gateway.MetaInvocations.RetentionDays` controls how long completed and uncertain records are retained; it defaults to `30` days. A record's event journal is deleted together with the record, so an expired run does not leave an orphaned `meta-invocations/*.events.ndjson` behind. Set retention to at least the longest retry window of any caller, including the DrasiWake outbox, so an old retry cannot outlive its deduplication record.

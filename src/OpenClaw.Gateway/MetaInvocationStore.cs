@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Collections.Concurrent;
 using OpenClaw.Core.Models;
+using OpenClaw.Gateway.Inbox;
 using OpenClaw.Gateway.Models;
 
 namespace OpenClaw.Gateway;
@@ -11,9 +12,13 @@ public sealed class MetaInvocationStore : IHostedService, IDisposable
     private readonly string _lockPath;
     private readonly int _retentionDays;
     private readonly MetaRunEventLog _events;
+    private readonly IInboxRunEventSink? _inboxEvents;
     private readonly ConcurrentDictionary<Guid, FileStream> _activeLeases = new();
 
-    public MetaInvocationStore(string storagePath, int retentionDays)
+    public MetaInvocationStore(
+        string storagePath,
+        int retentionDays,
+        IInboxRunEventSink? inboxEvents = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(storagePath);
         if (retentionDays < 1)
@@ -23,6 +28,7 @@ public sealed class MetaInvocationStore : IHostedService, IDisposable
         _lockPath = _path + ".lock";
         _retentionDays = retentionDays;
         _events = new MetaRunEventLog(Path.GetDirectoryName(_path)!);
+        _inboxEvents = inboxEvents;
     }
 
     /// <summary>The run journal, exposed so read endpoints do not have to re-derive its paths.</summary>
@@ -441,7 +447,12 @@ public sealed class MetaInvocationStore : IHostedService, IDisposable
         {
             var kept = DedupeSynthetic(record.InvocationId, drafts);
             if (kept.Count > 0)
-                await _events.AppendAsync(record.InvocationId, kept, DateTimeOffset.UtcNow, cancellationToken);
+            {
+                var atUtc = DateTimeOffset.UtcNow;
+                var lastSeq = await _events.AppendAsync(record.InvocationId, kept, atUtc, cancellationToken);
+                PublishToInbox(record.InvocationId, kept, lastSeq - kept.Count + 1, atUtc);
+            }
+
             return record;
         }
         catch (Exception exception) when (exception is IOException
@@ -450,6 +461,42 @@ public sealed class MetaInvocationStore : IHostedService, IDisposable
             or NotSupportedException)
         {
             return record with { EventsGap = true };
+        }
+    }
+
+    /// <summary>
+    /// Hands the events that were just written to the inbox projector.
+    /// </summary>
+    /// <remarks>
+    /// The sequence numbers are derived (<c>lastSeq - count + 1</c>) instead of read back: re-reading
+    /// the journal inside the ledger lock would double the IO of every write for information this
+    /// call already has. Publishing is a channel write, so it cannot fail or block; the try/catch is
+    /// here because a projection is never allowed to break a state transition.
+    /// </remarks>
+    private void PublishToInbox(Guid invocationId, IReadOnlyList<MetaRunEventDraft> drafts, long firstSeq, DateTimeOffset atUtc)
+    {
+        if (_inboxEvents is null)
+            return;
+
+        try
+        {
+            for (var index = 0; index < drafts.Count; index++)
+            {
+                var draft = drafts[index];
+                _inboxEvents.Publish(new MetaRunEvent(
+                    invocationId,
+                    firstSeq + index,
+                    atUtc,
+                    draft.Kind,
+                    draft.StepId,
+                    draft.Status,
+                    draft.Detail,
+                    draft.Synthetic));
+            }
+        }
+        catch (Exception exception) when (exception is InvalidOperationException or ObjectDisposedException)
+        {
+            // A closed queue (shutdown) is not an error worth surfacing here.
         }
     }
 

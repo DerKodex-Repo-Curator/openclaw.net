@@ -44,6 +44,10 @@ public sealed class GatewayConfig
     public McpAppsConfig McpApps { get; set; } = new();
     public McpCompatibilityConfig McpCompatibility { get; set; } = new();
     public MetaInvocationsConfig MetaInvocations { get; set; } = new();
+
+    /// <summary>Durable todo list settings (B7); see <see cref="InboxConfig"/>.</summary>
+    public InboxConfig Inbox { get; set; } = new();
+
     public IntegrationConfig Integration { get; set; } = new();
     public DeploymentConfig Deployment { get; set; } = new();
     public TailscaleConfig Tailscale { get; set; } = new();

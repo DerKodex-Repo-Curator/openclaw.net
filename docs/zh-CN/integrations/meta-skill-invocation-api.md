@@ -220,6 +220,159 @@ Authorization: Bearer <operator-token>
 | `RecoveryThreshold` | `3` | 连续成功多少次回到 `healthy`。 |
 | `HideUnhealthyTools` | `true` | `down` 的工具是否从模型可见的工具表中移除；无论如何调用都会被拒绝。 |
 
+## 收件箱（持久待办）
+
+通知可以丢，待办不能丢。收件箱是通知路径的持久对偶：DrasiWake 的 `inbox` 通道投递到
+`POST /api/integration/inbox/items`，其余条目都是网关已知道的事实的投影（停住的 run、已决的审批、
+挂掉的 server、降级的索引）。没有任何别的入口能创建条目，所以「通知量大」不会淹掉待办列表——
+哪个类别值得成为待办，由发送端的通道过滤器决定。
+
+```http
+GET  /api/inbox?state=&kind=&cursor=&limit=
+GET  /api/inbox/stream
+POST /api/inbox/{id}/ack
+POST /api/inbox/{id}/snooze    {"untilUtc":"2026-10-18T09:00:00Z"}
+POST /api/inbox/{id}/resolve   {"resolutionCode":"resolved"}
+POST /api/admin/inbox/rebuild
+Authorization: Bearer <operator-token>
+```
+
+| 端点 | Scope | 行为 |
+| --- | --- | --- |
+| `GET /api/inbox` | `inbox.read` | 按 `createdAtUtc` + `id` 的 keyset 分页，最新在前。`state` 接受 `Open` / `Acknowledged` / `Resolved` / `Expired`（大小写不敏感），或 `active` 表示两个活跃态；`kind` 收窄到单一 kind；`limit` 默认 `50`，上限取 `OpenClaw:Inbox:MaxPageSize`。把 `nextCursor` 原样回填 `cursor`；畸形游标返回 `400 inbox.bad_request`。 |
+| `POST /api/inbox/{id}/ack` | `inbox.mutate` | `Open → Acknowledged`。ack 是「我看到了」，不是「事情完了」：它不关闭条目，也不改动底层资源。重复调用是幂等空操作，返回 `200` 和原样条目。 |
+| `POST /api/inbox/{id}/snooze` | `inbox.mutate` | `{untilUtc}` 把条目压回 `Open` 并记下截止时间，扫描到期后重新变成待办。目标时间不在未来返回 `400 inbox.snooze_in_past`。 |
+| `POST /api/inbox/{id}/resolve` | `inbox.mutate` | 人工关闭，仅对 `notification` 有效；其余 kind 的关闭权属于资源本身，因此返回 `409 inbox.resource_driven`。空 body 等价于 `{"resolutionCode":"resolved"}`。 |
+| `GET /api/inbox/stream` | `inbox.read` | 服务端推送，每次变化一帧 `event: inbox_item`（见下）。 |
+| `POST /api/admin/inbox/rebuild` | `admin.inbox.rebuild` | 从日志重算投影，返回 `{items, eventsRead, skipped}`。幂等：已收敛的网关上重建不改变任何东西，人工的 ack / snooze 按条目 id 保留。 |
+| `POST /api/integration/inbox/items` | `integration.mutate.inbox` | 上面的接入端点；发送方不需要读列表的权限。 |
+
+### Kind
+
+`kind` 是封闭集，只决定两件事：运维看到的标题模板，以及谁拥有关闭权。
+
+| Kind | 严重度 | 默认 TTL | 由谁关闭 |
+| --- | --- | --- | --- |
+| `approval` | `Warning` | 7 天 | 审批决定（`approved` / `rejected`）。 |
+| `run_paused` | `Info` | 7 天 | run 恢复、完成或失败（`auto_closed`）。同一 run 产生 `approval` 时它立即被关闭——一个阻塞只留一条待办。 |
+| `run_failed` | `Critical` | 7 天 | 无人关闭，到期 `Expired`：已经结束的 run 没法「修好」。 |
+| `mcp_down` | `Critical` | 1 天 | server 恢复（`recovered`）。 |
+| `skill_degraded` | `Warning` | 1 天 | 索引重新编译干净（`recovered`）。 |
+| `notification` | 取自信封 | 7 天 | 人（`resolved`）。唯一允许人工关闭的 kind。 |
+
+条目打开后严重度只升不降：同一资源的第二次、更严重的告警会抬高标签，但不会降低，也不会新开一条。
+描述同一资源的两个活跃条目就是一条条目，与事件次数无关。
+
+### 状态
+
+```
+Open ──ack──▶ Acknowledged ──(底层资源变化)──▶ Resolved
+ │                  │
+ │                  └──snooze(until)──▶ Open        （扫描后自动回来）
+ └──(超过 TTL)──▶ Expired
+```
+
+`Resolved` 与 `Expired` 是终态，不再变化。**自动关闭优先**：审批已决、run 到终态、server 恢复、索引修复，
+都会直接关闭对应条目，不等人工确认——比原因活得更久的待办，只会训练运维忽略列表。而人工 ack
+完全不改底层状态，这个不对称正是要点：「我看过了」不等于「它结束了」。
+
+`resolutionCode` 是封闭集：`approved`、`rejected`、`completed`、`failed`、`recovered`、
+`auto_closed`、`resolved`、`expired`。
+
+### 读列表
+
+```json
+{
+  "items": [
+    {
+      "id": "ib_5f0c1d9a7b3e4c62a8d10f4b",
+      "kind": "run_paused",
+      "severity": "Info",
+      "title": "Run is waiting for input",
+      "subject": { "invocationId": "3a1d3589-2856-4f6b-b572-9f9e060db134", "stepId": "review", "resourceKey": "run:3a1d3589-…" },
+      "createdAtUtc": "2026-10-17T09:12:03Z",
+      "updatedAtUtc": "2026-10-17T09:12:03Z",
+      "state": "Open",
+      "snoozeUntilUtc": null,
+      "resolvedAtUtc": null,
+      "resolutionCode": null,
+      "expiresAtUtc": "2026-10-24T09:12:03Z"
+    }
+  ],
+  "nextCursor": "1762000000000:ib_5f0c1d9a7b3e4c62a8d10f4b",
+  "counts": { "open": 1, "acknowledged": 0, "total": 1 }
+}
+```
+
+`counts` 是调用方的整个收件箱，不是当前页，因此角标不必翻页统计。`subject` 里只有标识符——调用、
+审批、会话、server、step id。没有 prompt 文本、没有步骤输入、没有模型输出：条目可以贴到大屏上，
+也可以进日志。
+
+### 流
+
+```
+event: inbox_item
+id: 41
+data: {"seq":41,"change":"opened","item":{ … }}
+
+event: inbox_gap
+data: {"lastSeq":57}
+```
+
+`change` 为 `opened`、`updated`、`resolved`、`expired`。`id` 是进程内单调序号；带 `Last-Event-ID`
+重连恰好拿到漏掉的帧，不重复。回放环刻意做得小：客户端落后太多时，服务端只发一帧
+`event: inbox_gap` 带上当前 `lastSeq`，要求客户端重新拉 `GET /api/inbox`，而不是假装部分回放等于完整回放。
+`: keepalive` 注释帧只保活，不算变化。
+
+### 接通知
+
+```http
+POST /api/integration/inbox/items
+Content-Type: application/json
+
+{
+  "schemaVersion": 2,
+  "id": "ntf_9a1c2f",
+  "category": "approval.pending",
+  "severity": "Warning",
+  "subjectStableId": "run:3a1d3589",
+  "resource": { "kind": "invocation", "id": "3a1d3589" },
+  "message": "A tool step is waiting for approval.",
+  "attributes": { "stepId": "charge" },
+  "occurredAtUtc": "2026-10-17T09:12:03Z",
+  "dedupeKey": "approval:map_9f2c41d7a8b3"
+}
+```
+
+信封的 `id` 就是去重键，因此发送端「每次重试都带同一个 `Idempotency-Key`」的重试节奏会收敛成一条
+条目，而不是每次重试多一条待办。只接受 `schemaVersion: 2` 的信封——v1 返回 `400 inbox.bad_request`，
+因为 v1 既没有 category 也没有稳定 id 可供关联。`attributes` 里只保留 `stepId`：它是唯一能点进去的字段，
+把其余字段存下来等于让发送方控制的文本进入持久存储。响应是落库后的条目。
+
+### 错误码
+
+| 状态 | 码 | 含义 |
+| --- | --- | --- |
+| `404` | `inbox.disabled` | `OpenClaw:Inbox:Enabled` 为 `false`，整套面未挂载。 |
+| `404` | `inbox.not_found` | 条目 id 不存在。 |
+| `400` | `inbox.bad_request` | body、游标或查询参数畸形。 |
+| `400` | `inbox.snooze_in_past` | `untilUtc` 不在未来。 |
+| `409` | `inbox.invalid_state` | 条目已终态，本次变更不适用。 |
+| `409` | `inbox.resource_driven` | 人工试图关闭由资源驱动的条目。 |
+
+配置（`OpenClaw:Inbox`）：
+
+| 键 | 默认值 | 含义 |
+| --- | --- | --- |
+| `Enabled` | `true` | 是否挂载整套面；`false` 时所有端点返回 `404 inbox.disabled`，投影也停止。 |
+| `SweepInterval` | `00:00:30` | 过期条目与到点的 snooze 多久应用一次。 |
+| `Ttl` | 按 kind（见上表） | 按 kind 覆盖 TTL，例如 `Ttl:run_failed: 3.00:00:00`。 |
+| `MaxPageSize` | `200` | 单页上限。 |
+
+投影落在 `{Memory.StoragePath}/inbox/items.ndjson`，每次转移一行，加载时压实。它不含任何用户内容，
+且可由 run 日志完整重算——这也正是 `rebuild` 存在的理由：一个不能重算的投影就是第二个事实源，
+而它迟早会烂掉。
+
 ## 幂等与恢复
 
 调用声明和终态结果保存在已配置的 Gateway `Memory.StoragePath` 下。`Gateway.MetaInvocations.RetentionDays` 控制已完成和不确定记录的保留时间，默认值为 `30` 天。请将该值设为不短于任何调用方的最长重试期限，包括 DrasiWake outbox 的最长重试期限，避免重试发生时去重记录已过期。

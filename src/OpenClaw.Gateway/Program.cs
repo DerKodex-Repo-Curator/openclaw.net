@@ -78,6 +78,7 @@ while (true)
         builder.Services.AddOpenClawVaultSecrets(startup.Config.Security.Vault);
 #endif
         builder.Services.AddOpenClawMcpServices(startup);
+        builder.Services.AddOpenClawInboxServices(startup);
         builder.Services.ApplyOpenClawRuntimeProfile(startup);
         builder.Services.AddMicrosoftAgentFramework(builder.Configuration);
         builder.Services.AddOpenClawA2AServices();
