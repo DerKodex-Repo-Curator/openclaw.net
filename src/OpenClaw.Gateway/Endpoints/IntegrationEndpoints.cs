@@ -11,7 +11,7 @@ using OpenClaw.Payments.Core;
 
 namespace OpenClaw.Gateway.Endpoints;
 
-internal static class IntegrationEndpoints
+internal static partial class IntegrationEndpoints
 {
     /// <summary>Upper bound for the <c>X-OpenClaw-Resume</c> header payload.</summary>
     private const int MaxResumeHeaderBytes = 32 * 1024;
@@ -24,6 +24,7 @@ internal static class IntegrationEndpoints
         var browserSessions = app.Services.GetRequiredService<BrowserSessionAuthService>();
         var facade = IntegrationApiFacade.Create(startup, runtime, app.Services);
         var group = app.MapGroup("/api/integration").WithTags("OpenClaw Integration");
+        MapSkillIndexEndpoint(group, startup, runtime, browserSessions);
 
         group.MapPost("/meta-invocations", async (HttpContext ctx) =>
         {
@@ -88,6 +89,10 @@ internal static class IntegrationEndpoints
                 if (resume is null)
                     return BadIntegrationRequest("Invalid JSON in the X-OpenClaw-Resume header.");
             }
+
+            // Reported on both the success and the refusal path: a caller needs to know which index
+            // answered even when the answer is 503 skills.not_ready.
+            AnnotateSkillIndex(ctx);
 
             var outcome = await facade.InvokeMetaSkillAsync(
                 caller.AccountId ?? "bootstrap",

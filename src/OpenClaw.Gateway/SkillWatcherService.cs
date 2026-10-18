@@ -9,6 +9,7 @@ internal sealed class SkillWatcherService : IAsyncDisposable, IDisposable
     private readonly IAgentRuntime _agentRuntime;
     private readonly ILogger<SkillWatcherService> _logger;
     private readonly Action<IReadOnlyList<SkillDefinition>>? _onSkillsReloaded;
+    private readonly SkillIndexCompiler? _skillIndexCompiler;
     private readonly Channel<byte> _reloadRequests = Channel.CreateUnbounded<byte>(new UnboundedChannelOptions
     {
         SingleReader = true,
@@ -29,11 +30,13 @@ internal sealed class SkillWatcherService : IAsyncDisposable, IDisposable
         IReadOnlyList<string>? pluginSkillDirs,
         IAgentRuntime agentRuntime,
         ILogger<SkillWatcherService> logger,
-        Action<IReadOnlyList<SkillDefinition>>? onSkillsReloaded = null)
+        Action<IReadOnlyList<SkillDefinition>>? onSkillsReloaded = null,
+        SkillIndexCompiler? skillIndexCompiler = null)
     {
         _agentRuntime = agentRuntime;
         _logger = logger;
         _onSkillsReloaded = onSkillsReloaded;
+        _skillIndexCompiler = skillIndexCompiler;
         _watchRoots = GetWatchRoots(config, workspacePath, pluginSkillDirs)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToArray();
@@ -282,6 +285,26 @@ internal sealed class SkillWatcherService : IAsyncDisposable, IDisposable
 
         try
         {
+            if (_skillIndexCompiler is not null)
+            {
+                // Design §7.2: the watcher no longer hands a freshly parsed list to the runtime.
+                // It asks the compiler for a new index and then applies that exact snapshot to every
+                // consumer, so the served skills and the reported index version cannot diverge.
+                var snapshot = await _skillIndexCompiler
+                    .CompileAsync(SkillIndexCompileTrigger.FileChange, _stoppingToken)
+                    .ConfigureAwait(false);
+
+                await _agentRuntime.ApplySkillIndexAsync(snapshot, _stoppingToken).ConfigureAwait(false);
+                _logger.LogInformation(
+                    "Applied skill index v{Version} ({Count} skills, state={State}) after file change.",
+                    snapshot.Version,
+                    snapshot.Skills.Count,
+                    snapshot.StateName);
+
+                _onSkillsReloaded?.Invoke(snapshot.Skills);
+                return;
+            }
+
             var loadedSkillNames = await _agentRuntime.ReloadSkillsAsync(_stoppingToken);
             _logger.LogInformation("Reloaded {Count} skills after file change.", loadedSkillNames.Count);
             if (_onSkillsReloaded is not null)

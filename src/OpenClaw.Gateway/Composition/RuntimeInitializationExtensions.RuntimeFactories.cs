@@ -367,6 +367,7 @@ internal static partial class RuntimeInitializationExtensions
             Hooks = hooks,
             RequireToolApproval = requireToolApproval,
             ApprovalRequiredTools = approvalRequiredTools,
+            SkillIndexCompiler = services.GetService<SkillIndexCompiler>(),
             TurnTokenUsageObserver = services.GetService<ITurnTokenUsageObserver>(),
             ToolSandbox = toolSandbox,
             ToolGovernance = services.GetRequiredService<IToolGovernanceService>(),

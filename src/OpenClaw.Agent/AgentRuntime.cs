@@ -69,6 +69,7 @@ public sealed class AgentRuntime : IAgentRuntime
     private readonly bool _metaSkillsEnabled;
     private readonly string? _skillWorkspacePath;
     private readonly IReadOnlyList<string> _pluginSkillDirs;
+    private readonly SkillIndexCompiler? _skillIndexCompiler;
     private readonly IRedactionPipeline _redaction;
     private readonly ISentinelSubstitutionService _sentinelSubstitution;
     private readonly string? _memoryRecallPrefix;
@@ -127,7 +128,8 @@ public sealed class AgentRuntime : IAgentRuntime
         IGoalService? goalService = null,
         IReadOnlyList<IToolResultInterceptor>? interceptors = null,
         CapabilitySlotExecutor? capabilitySlotExecutor = null,
-        IMetaApprovalStore? metaApprovals = null)
+        IMetaApprovalStore? metaApprovals = null,
+        SkillIndexCompiler? skillIndexCompiler = null)
     {
         _logger = logger;
         _capabilitySlotExecutor = capabilitySlotExecutor;
@@ -154,6 +156,7 @@ public sealed class AgentRuntime : IAgentRuntime
         _metaSkillsEnabled = skillsConfig?.MetaSkill.Enabled ?? true;
         _skillWorkspacePath = skillWorkspacePath;
         _pluginSkillDirs = pluginSkillDirs ?? [];
+        _skillIndexCompiler = skillIndexCompiler;
         _redaction = redaction ?? new NoopRedactionPipeline();
         _sentinelSubstitution = sentinelSubstitution ?? new NoopSentinelSubstitutionService();
         _circuitBreaker = new CircuitBreaker(
@@ -226,14 +229,38 @@ public sealed class AgentRuntime : IAgentRuntime
         }
     }
 
-    public Task<IReadOnlyList<string>> ReloadSkillsAsync(CancellationToken ct = default)
+    public Task ApplySkillIndexAsync(SkillIndexSnapshot snapshot, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        ApplySkills(snapshot.Skills);
+        return Task.CompletedTask;
+    }
+
+    public async Task<IReadOnlyList<string>> ReloadSkillsAsync(CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
 
         if (_skillsConfig is null)
-            return Task.FromResult<IReadOnlyList<string>>(LoadedSkillNames);
+            return LoadedSkillNames;
 
         var logger = _logger ?? NullLogger.Instance;
+
+        if (_skillIndexCompiler is not null)
+        {
+            // Single source of truth: the compiler owns parsing and versioning, the runtime only
+            // applies whatever it publishes. A rejected compile yields the last known good skills.
+            var snapshot = await _skillIndexCompiler
+                .CompileAsync(SkillIndexCompileTrigger.FileChange, ct)
+                .ConfigureAwait(false);
+            ApplySkills(snapshot.Skills);
+            logger.LogInformation(
+                "Applied skill index v{Version} ({Count} skills, state={State}).",
+                snapshot.Version,
+                snapshot.Skills.Count,
+                snapshot.StateName);
+            return LoadedSkillNames;
+        }
+
         var skills = SkillLoader.LoadAll(_skillsConfig, _skillWorkspacePath, logger, _pluginSkillDirs);
         ApplySkills(skills);
 
@@ -242,7 +269,7 @@ public sealed class AgentRuntime : IAgentRuntime
         else
             logger.LogInformation("No skills loaded.");
 
-        return Task.FromResult<IReadOnlyList<string>>(LoadedSkillNames);
+        return LoadedSkillNames;
     }
 
     public Task ApplyMcpToolChangesAsync(

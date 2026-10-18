@@ -5,6 +5,7 @@ using OpenClaw.Agent;
 using OpenClaw.Core.Approvals;
 using OpenClaw.Core.Models;
 using OpenClaw.Core.Sessions;
+using OpenClaw.Core.Skills;
 using OpenClaw.Gateway.Models;
 
 namespace OpenClaw.Gateway;
@@ -14,7 +15,9 @@ public sealed class MetaInvocationService(
     SessionManager sessionManager,
     IAgentRuntime agentRuntime,
     ILogger<MetaInvocationService> logger,
-    IMetaApprovalStore? approvals = null)
+    IMetaApprovalStore? approvals = null,
+    SkillIndexCompiler? skillIndexCompiler = null,
+    SkillsConfig? skillsConfig = null)
 {
     public async Task<MetaInvocationExecutionResult> InvokeAsync(
         string callerId,
@@ -25,6 +28,21 @@ public sealed class MetaInvocationService(
         CancellationToken cancellationToken,
         MetaInvocationResumeRequest? resume = null)
     {
+        // Design §7.3: an index that has never been published is a deployment fault, not a
+        // "skill not found". Answering 503 here keeps the ledger clean (no invocation record) and
+        // gives the caller something actionable. Callers that never wired a compiler - embedded
+        // hosts and tests - keep the previous behaviour.
+        if (skillIndexCompiler is not null && (skillsConfig?.FailClosedOnUnreadyIndex ?? true))
+        {
+            var index = skillIndexCompiler.Current;
+            if (!index.Ready)
+            {
+                return new MetaInvocationExecutionResult(
+                    StatusCodes.Status503ServiceUnavailable,
+                    Error: "skills.not_ready");
+            }
+        }
+
         var session = await sessionManager.LoadAsync(request.SessionId, cancellationToken);
         if (session is null)
             return new MetaInvocationExecutionResult(StatusCodes.Status404NotFound, Error: "Session not found.");

@@ -42,6 +42,20 @@ public sealed class SkillsConfig
     /// Values &lt;= 0 fall back to the built-in default (256 KB).
     /// </summary>
     public int MaxResourceReadBytes { get; set; } = 256 * 1024;
+
+    /// <summary>
+    /// When <see langword="true"/> (the default), a meta-skill invocation is rejected with
+    /// <c>503 skills.not_ready</c> while the skill index has never been published, instead of
+    /// reaching the runtime and failing there with an unrelated "skill not found".
+    /// </summary>
+    public bool FailClosedOnUnreadyIndex { get; set; } = true;
+
+    /// <summary>
+    /// When <see langword="true"/>, <c>GET /health/ready</c> reports 503 while the skill index is
+    /// degraded (published, but the latest compile attempt carried diagnostics). Defaults to
+    /// <see langword="false"/>: a degraded index can still serve traffic.
+    /// </summary>
+    public bool FailOnDegradedSkills { get; set; } = false;
 }
 
 public sealed class MetaSkillPolicyConfig

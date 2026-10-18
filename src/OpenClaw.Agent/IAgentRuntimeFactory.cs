@@ -39,6 +39,14 @@ public sealed class AgentRuntimeFactoryContext
     public Action<Session, string>? AppendContractSnapshot { get; init; }
     public IReadOnlyList<IToolResultInterceptor>? Interceptors { get; init; }
     public CapabilitySlotExecutor? CapabilitySlotExecutor { get; init; }
+
+    /// <summary>
+    /// Authoritative skill index compiler. When present the runtime reloads skills by asking the
+    /// compiler for its current snapshot instead of parsing the skill tree itself, so the index
+    /// reported by the gateway and the skills the runtime serves can never diverge. When absent
+    /// (tests, embedded hosts) the runtime keeps parsing directly.
+    /// </summary>
+    public SkillIndexCompiler? SkillIndexCompiler { get; init; }
 }
 
 public interface IAgentRuntimeFactory

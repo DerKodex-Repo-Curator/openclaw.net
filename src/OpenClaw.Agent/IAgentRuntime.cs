@@ -53,6 +53,15 @@ public interface IAgentRuntime
 
     Task<IReadOnlyList<string>> ReloadSkillsAsync(CancellationToken ct = default);
 
+    /// <summary>
+    /// Applies an already compiled skill index. The runtime must not re-parse the skill tree here:
+    /// the caller (<c>SkillWatcherService</c>, or a composition root) compiled once so that every
+    /// consumer - the runtime, the artifact runtime, the endpoints - serves the same index version.
+    /// Default no-op keeps test doubles and hosts without a skill index working unchanged.
+    /// </summary>
+    Task ApplySkillIndexAsync(SkillIndexSnapshot snapshot, CancellationToken ct = default)
+        => Task.CompletedTask;
+
     IAsyncEnumerable<AgentStreamEvent> RunStreamingAsync(
         Session session,
         string userMessage,

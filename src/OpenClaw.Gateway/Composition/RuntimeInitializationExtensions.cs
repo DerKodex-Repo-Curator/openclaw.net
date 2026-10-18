@@ -141,8 +141,23 @@ internal static partial class RuntimeInitializationExtensions
 
         var combinedPluginSkillRoots = CollectPluginSkillRoots(pluginComposition);
 
+        // B4: one authoritative compile, performed before the runtime exists. Everything downstream -
+        // the runtime factory, the artifact runtime, the probes and every endpoint - reads this same
+        // snapshot, so there is no window where the runtime has new skills and the index reports old
+        // ones (design §7.2). The hosted-service compile in SkillIndexCompiler sees Version > 0 and
+        // skips its own pass.
+        var skillIndexCompiler = app.Services.GetService<SkillIndexCompiler>();
+        var skillIndex = SkillIndexSnapshot.Empty;
+        if (skillIndexCompiler is not null)
+        {
+            skillIndexCompiler.Configure(resolvedRuntimeWorkspacePath, combinedPluginSkillRoots);
+            skillIndex = await skillIndexCompiler.CompileAsync(SkillIndexCompileTrigger.Startup);
+        }
+
         var skillLogger = loggerFactory.CreateLogger("SkillLoader");
-        var skills = SkillLoader.LoadAll(config.Skills, resolvedRuntimeWorkspacePath, skillLogger, combinedPluginSkillRoots);
+        IReadOnlyList<SkillDefinition> skills = skillIndexCompiler is not null
+            ? skillIndex.Skills
+            : SkillLoader.LoadAll(config.Skills, resolvedRuntimeWorkspacePath, skillLogger, combinedPluginSkillRoots);
         if (skills.Count > 0)
             skillLogger.LogInformation("{Summary}", SkillPromptBuilder.BuildSummary(skills));
         artifactRuntime.ReplaceSkills(skills);
@@ -212,7 +227,8 @@ internal static partial class RuntimeInitializationExtensions
             combinedPluginSkillRoots,
             agentRuntime,
             app.Services.GetRequiredService<ILogger<SkillWatcherService>>(),
-            skills => artifactRuntime.ReplaceSkills(skills));
+            skills => artifactRuntime.ReplaceSkills(skills),
+            skillIndexCompiler);
         skillWatcher.Start(app.Lifetime.ApplicationStopping);
         var mcpWatcher = StartMcpWorkspaceWatcher(app, services, startup, agentRuntime);
         var capabilitySources = app.Services.GetServices<OpenClaw.Core.Skills.Meta.ICapabilityChangeSource>().ToArray();

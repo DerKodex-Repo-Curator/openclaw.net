@@ -46,6 +46,7 @@ public sealed class MafAgentRuntime : IAgentRuntime
     private readonly bool _metaSkillsEnabled;
     private readonly string? _skillWorkspacePath;
     private readonly IReadOnlyList<string> _pluginSkillDirs;
+    private readonly SkillIndexCompiler? _skillIndexCompiler;
     private readonly int _maxHistoryTurns;
     private readonly bool _enableCompaction;
     private readonly int _compactionThreshold;
@@ -114,6 +115,7 @@ public sealed class MafAgentRuntime : IAgentRuntime
         _metaSkillsEnabled = context.SkillsConfig?.MetaSkill.Enabled ?? true;
         _skillWorkspacePath = context.WorkspacePath;
         _pluginSkillDirs = context.PluginSkillDirs;
+        _skillIndexCompiler = context.SkillIndexCompiler;
         _maxHistoryTurns = Math.Max(1, context.Config.Memory.MaxHistoryTurns);
         _enableCompaction = context.Config.Memory.EnableCompaction;
         _compactionThreshold = Math.Max(4, context.Config.Memory.CompactionThreshold);
@@ -179,14 +181,37 @@ public sealed class MafAgentRuntime : IAgentRuntime
         }
     }
 
-    public Task<IReadOnlyList<string>> ReloadSkillsAsync(CancellationToken ct = default)
+    public Task ApplySkillIndexAsync(SkillIndexSnapshot snapshot, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        ApplySkills(snapshot.Skills);
+        return Task.CompletedTask;
+    }
+
+    public async Task<IReadOnlyList<string>> ReloadSkillsAsync(CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
 
         if (_skillsConfig is null)
-            return Task.FromResult<IReadOnlyList<string>>(LoadedSkillNames);
+            return LoadedSkillNames;
 
         var logger = _logger ?? NullLogger.Instance;
+
+        if (_skillIndexCompiler is not null)
+        {
+            // Same contract as the native runtime: the compiler parses, this runtime applies.
+            var snapshot = await _skillIndexCompiler
+                .CompileAsync(SkillIndexCompileTrigger.FileChange, ct)
+                .ConfigureAwait(false);
+            ApplySkills(snapshot.Skills);
+            logger.LogInformation(
+                "Applied skill index v{Version} ({Count} skills, state={State}) for the Microsoft Agent Framework runtime.",
+                snapshot.Version,
+                snapshot.Skills.Count,
+                snapshot.StateName);
+            return LoadedSkillNames;
+        }
+
         var skills = SkillLoader.LoadAll(_skillsConfig, _skillWorkspacePath, logger, _pluginSkillDirs);
         ApplySkills(skills);
 
@@ -195,7 +220,7 @@ public sealed class MafAgentRuntime : IAgentRuntime
         else
             logger.LogInformation("No skills loaded for the Microsoft Agent Framework runtime.");
 
-        return Task.FromResult<IReadOnlyList<string>>(LoadedSkillNames);
+        return LoadedSkillNames;
     }
 
     public Task ApplyMcpToolChangesAsync(

@@ -19,7 +19,26 @@ public static class SkillLoader
     /// Load and filter all eligible skills from the standard locations.
     /// Precedence: workspace > managed > bundled > extra dirs.
     /// </summary>
+    /// <remarks>
+    /// Thin wrapper over <see cref="LoadAllDetailed"/> for callers that only need the skill list.
+    /// Anything that needs to report on the load (readiness, skill index) must use the detailed
+    /// overload so parse failures are not silently dropped.
+    /// </remarks>
     public static List<SkillDefinition> LoadAll(
+        SkillsConfig config,
+        string? workspacePath,
+        ILogger logger,
+        IReadOnlyList<string>? pluginSkillDirs = null)
+    {
+        var result = LoadAllDetailed(config, workspacePath, logger, pluginSkillDirs);
+        return result.Skills as List<SkillDefinition> ?? [.. result.Skills];
+    }
+
+    /// <summary>
+    /// Load and filter all eligible skills from the standard locations, collecting diagnostics for
+    /// every file that could not be turned into a skill and a content stamp for every file read.
+    /// </summary>
+    public static SkillLoadResult LoadAllDetailed(
         SkillsConfig config,
         string? workspacePath,
         ILogger logger,
@@ -28,9 +47,10 @@ public static class SkillLoader
         if (!config.Enabled)
         {
             logger.LogInformation("Skills system is disabled");
-            return [];
+            return SkillLoadResult.Empty;
         }
 
+        var collector = new SkillLoadCollector();
         var allSkills = new Dictionary<string, SkillDefinition>(StringComparer.OrdinalIgnoreCase);
 
         // 1. Extra dirs (lowest precedence — added first, overwritten by higher)
@@ -38,7 +58,7 @@ public static class SkillLoader
         foreach (var dir in config.Load.ExtraDirs)
         {
             if (Directory.Exists(dir))
-                ScanDirectory(dir, SkillSource.Extra, allSkills, logger, scanSubdirectories);
+                ScanDirectory(dir, SkillSource.Extra, allSkills, logger, scanSubdirectories, collector);
         }
 
         // 2. Bundled skills
@@ -46,7 +66,7 @@ public static class SkillLoader
         {
             var bundledDir = Path.Combine(AppContext.BaseDirectory, "skills");
             if (Directory.Exists(bundledDir))
-                ScanDirectory(bundledDir, SkillSource.Bundled, allSkills, logger, scanSubdirectories);
+                ScanDirectory(bundledDir, SkillSource.Bundled, allSkills, logger, scanSubdirectories, collector);
         }
 
         // 3. Managed/local skills
@@ -56,7 +76,7 @@ public static class SkillLoader
                 ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".openclaw", "skills")
                 : NormalizeManagedRootPath(config.Load.ManagedRoot, logger);
             if (managedDir is not null && TryDirectoryExists(managedDir))
-                ScanDirectory(managedDir, SkillSource.Managed, allSkills, logger, scanSubdirectories);
+                ScanDirectory(managedDir, SkillSource.Managed, allSkills, logger, scanSubdirectories, collector);
         }
 
         // 4. Plugin-packaged skills
@@ -65,7 +85,7 @@ public static class SkillLoader
             foreach (var pluginDir in pluginSkillDirs)
             {
                 if (Directory.Exists(pluginDir))
-                    ScanDirectory(pluginDir, SkillSource.Plugin, allSkills, logger, scanSubdirectories);
+                    ScanDirectory(pluginDir, SkillSource.Plugin, allSkills, logger, scanSubdirectories, collector);
             }
         }
 
@@ -74,7 +94,7 @@ public static class SkillLoader
         {
             var wsSkillsDir = Path.Combine(workspacePath, "skills");
             if (Directory.Exists(wsSkillsDir))
-                ScanDirectory(wsSkillsDir, SkillSource.Workspace, allSkills, logger, scanSubdirectories);
+                ScanDirectory(wsSkillsDir, SkillSource.Workspace, allSkills, logger, scanSubdirectories, collector);
         }
 
         // Filter by config and requirements
@@ -111,7 +131,7 @@ public static class SkillLoader
         logger.LogInformation("Loaded {Count} eligible skills from {Total} discovered",
             eligible.Count, allSkills.Count);
 
-        return eligible;
+        return new SkillLoadResult(eligible, collector.Diagnostics, collector.Files);
     }
 
     private static string? NormalizeManagedRootPath(string managedRoot, ILogger logger)
@@ -161,6 +181,68 @@ public static class SkillLoader
         ex is ArgumentException or IOException or NotSupportedException or PathTooLongException or UnauthorizedAccessException;
 
     /// <summary>
+    /// Mutable accumulation buffer for a single detailed load. One instance travels through every
+    /// <see cref="ScanDirectory"/> call so the whole scan produces one coherent diagnostic list.
+    /// </summary>
+    private sealed class SkillLoadCollector
+    {
+        public List<SkillDiagnostic> Diagnostics { get; } = [];
+
+        public List<SkillFileStamp> Files { get; } = [];
+
+        public void AddDiagnostic(SkillDiagnostic diagnostic) => Diagnostics.Add(diagnostic);
+
+        public void AddParseFailure(string path, string? errorCode, string? message)
+            => Diagnostics.Add(SkillDiagnostic.Error(
+                path,
+                string.IsNullOrWhiteSpace(errorCode) ? "parse_failed" : errorCode!,
+                string.IsNullOrWhiteSpace(message) ? "Skill file could not be parsed." : message!));
+    }
+
+    /// <summary>
+    /// Records the content stamp for <paramref name="filePath"/>. Returns <see langword="false"/>
+    /// when the file could not be read, in which case a fatal diagnostic has been recorded.
+    /// </summary>
+    private static bool TryStampFile(
+        string filePath,
+        string rootDir,
+        SkillSource source,
+        SkillLoadCollector collector,
+        ILogger logger)
+    {
+        try
+        {
+            using var stream = new FileStream(
+                filePath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete);
+            var length = stream.Length;
+            var hash = SkillFingerprint.HashContent(stream);
+            collector.Files.Add(new SkillFileStamp(source.ToString(), RelativeTo(rootDir, filePath), length, hash));
+            return true;
+        }
+        catch (Exception ex) when (IsPathException(ex))
+        {
+            collector.AddDiagnostic(SkillDiagnostic.Error(filePath, "skill_file_unreadable", ex.Message));
+            logger.LogWarning(ex, "Failed to read skill file {Path}", filePath);
+            return false;
+        }
+    }
+
+    private static string RelativeTo(string rootDir, string filePath)
+    {
+        try
+        {
+            return Path.GetRelativePath(rootDir, filePath).Replace('\\', '/');
+        }
+        catch (Exception ex) when (IsPathException(ex))
+        {
+            return Path.GetFileName(filePath);
+        }
+    }
+
+    /// <summary>
     /// Scan a directory for subdirectories containing SKILL.md.
     /// Owner-qualified ClawHub paths (for example @owner/skill/SKILL.md) are
     /// always recognized. When <paramref name="scanSubdirectories"/> is true,
@@ -172,14 +254,15 @@ public static class SkillLoader
         SkillSource source,
         Dictionary<string, SkillDefinition> results,
         ILogger logger,
-        bool scanSubdirectories = false)
+        bool scanSubdirectories = false,
+        SkillLoadCollector? collector = null)
     {
         try
         {
             if (source == SkillSource.Plugin &&
                 string.Equals(Path.GetFileName(Path.TrimEndingDirectorySeparator(rootDir)), "commands", StringComparison.OrdinalIgnoreCase))
             {
-                ScanBundleCommandFiles(rootDir, results, logger);
+                ScanBundleCommandFiles(rootDir, results, logger, collector);
             }
 
             var rootSkillFile = Path.Combine(rootDir, "SKILL.md");
@@ -187,18 +270,24 @@ public static class SkillLoader
             {
                 try
                 {
-                    if (TryParseSkillFile(rootSkillFile, rootDir, source, out var skill, out var errorCode) && skill is not null)
+                    if (collector is not null && !TryStampFile(rootSkillFile, rootDir, source, collector, logger))
+                    {
+                        // Unreadable: the diagnostic is already recorded, nothing left to parse.
+                    }
+                    else if (TryParseSkillFile(rootSkillFile, rootDir, source, out var skill, out var errorCode) && skill is not null)
                     {
                         results[skill.Name] = skill;
                     }
                     else
                     {
                         logger.LogWarning("Failed to parse skill at {Path} (error_code={ErrorCode})", rootSkillFile, errorCode ?? "parse_failed");
+                        collector?.AddParseFailure(rootSkillFile, errorCode, null);
                     }
                 }
                 catch (Exception ex)
                 {
                     logger.LogWarning(ex, "Failed to parse skill at {Path}", rootSkillFile);
+                    collector?.AddDiagnostic(SkillDiagnostic.Error(rootSkillFile, "parse_exception", ex.Message));
                 }
             }
 
@@ -221,7 +310,13 @@ public static class SkillLoader
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
             foreach (var duplicateSlug in duplicateOwnerSlugs.OrderBy(static slug => slug, StringComparer.OrdinalIgnoreCase))
+            {
                 logger.LogWarning("Skipping duplicate owner-qualified skill slug '{Slug}' under {Dir}", duplicateSlug, rootDir);
+                collector?.AddDiagnostic(SkillDiagnostic.Warning(
+                    Path.Combine(rootDir, duplicateSlug!),
+                    "duplicate_owner_slug",
+                    $"Multiple owner-qualified skills share the slug '{duplicateSlug}'; only the first one is loaded."));
+            }
 
             var skillDirectories = topLevelDirectories
                 .Concat(ownerQualifiedDirectories.Where(dir => !duplicateOwnerSlugs.Contains(Path.GetFileName(dir))))
@@ -236,6 +331,9 @@ public static class SkillLoader
 
                 try
                 {
+                    if (collector is not null && !TryStampFile(skillFile, rootDir, source, collector, logger))
+                        continue;
+
                     if (TryParseSkillFile(skillFile, skillDir, source, out var skill, out var errorCode) && skill is not null)
                     {
                         // Higher precedence sources overwrite lower ones
@@ -244,24 +342,28 @@ public static class SkillLoader
                     else
                     {
                         logger.LogWarning("Failed to parse skill at {Path} (error_code={ErrorCode})", skillFile, errorCode ?? "parse_failed");
+                        collector?.AddParseFailure(skillFile, errorCode, null);
                     }
                 }
                 catch (Exception ex)
                 {
                     logger.LogWarning(ex, "Failed to parse skill at {Path}", skillFile);
+                    collector?.AddDiagnostic(SkillDiagnostic.Error(skillFile, "parse_exception", ex.Message));
                 }
             }
         }
         catch (Exception ex)
         {
             logger.LogWarning(ex, "Failed to scan skill directory {Dir}", rootDir);
+            collector?.AddDiagnostic(SkillDiagnostic.Error(rootDir, "skills_dir_unreadable", ex.Message));
         }
     }
 
     private static void ScanBundleCommandFiles(
         string commandRoot,
         IDictionary<string, SkillDefinition> results,
-        ILogger logger)
+        ILogger logger,
+        SkillLoadCollector? collector = null)
     {
         var options = new EnumerationOptions
         {
@@ -279,6 +381,12 @@ public static class SkillLoader
         {
             try
             {
+                if (collector is not null
+                    && !TryStampFile(commandFile, commandRoot, SkillSource.Plugin, collector, logger))
+                {
+                    continue;
+                }
+
                 var commandName = Path.GetFileNameWithoutExtension(commandFile);
                 var content = File.ReadAllText(commandFile);
                 var normalized = NormalizeBundleCommandContent(content, commandName);
@@ -287,6 +395,7 @@ public static class SkillLoader
                 if (skill is null)
                 {
                     logger.LogWarning("Failed to map bundle command at {Path} into a skill", commandFile);
+                    collector?.AddParseFailure(commandFile, "bundle_command_unmappable", null);
                     continue;
                 }
 
@@ -303,6 +412,7 @@ public static class SkillLoader
             catch (Exception ex) when (IsPathException(ex))
             {
                 logger.LogWarning(ex, "Skipping inaccessible bundle command at {Path}", commandFile);
+                collector?.AddDiagnostic(SkillDiagnostic.Error(commandFile, "bundle_command_unreadable", ex.Message));
             }
         }
     }

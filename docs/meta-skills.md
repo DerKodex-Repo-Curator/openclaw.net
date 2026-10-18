@@ -192,6 +192,51 @@ Per-skill overrides:
 }
 ```
 
+## Skill Index and Readiness
+
+Every skill the gateway can see is compiled into one versioned **skill index**. The runtime, the
+artifact runtime and every endpoint read that same index, so a hot reload cannot leave the runtime
+with skills the index does not know about (or the reverse). Compiling means "parse every `SKILL.md`,
+validate meta compositions, collect resources" — nothing is generated and nothing is written back
+to disk.
+
+| Situation | `state` | `/health/ready` | Meta invocation |
+| --- | --- | --- | --- |
+| Nothing compiled yet (or every attempt failed on first boot) | `unready` | `503` | `503 skills.not_ready` (`FailClosedOnUnreadyIndex=true`) |
+| Index published, latest attempt reported diagnostics | `degraded` | `200` (or `503` with `FailOnDegradedSkills=true`) | Allowed; response header `X-OpenClaw-Skill-Index: degraded` |
+| Index published, no diagnostics | `ready` | `200` | Allowed |
+
+Breaking one `SKILL.md` does **not** take the other skills offline: the previous index stays active
+(last known good) and the failure only shows up as a diagnostic. Two switches control how strict
+that is:
+
+```json
+{
+  "Skills": {
+    "FailClosedOnUnreadyIndex": true,
+    "FailOnDegradedSkills": false
+  }
+}
+```
+
+- `FailClosedOnUnreadyIndex` (default `true`) turns "the index never compiled" into an explicit
+  `503 skills.not_ready`. Set it to `false` only to keep a pre-index deployment behaviour.
+- `FailOnDegradedSkills` (default `false`) makes the readiness probe fail while the index is
+  degraded. Useful when a container probe is the only thing gating a rollout.
+
+In configuration files these are `Skills.FailClosedOnUnreadyIndex` and `Skills.FailOnDegradedSkills`.
+
+Operators can inspect and force a recompile:
+
+```
+GET  /api/integration/skill-index      # scope integration.read  - version, fingerprint, skills, diagnostics
+POST /admin/skills/reindex             # scope admin.skills.reindex - admin role + CSRF
+```
+
+`POST /admin/skills/reindex` returns both `version` and `previousVersion`. They are equal when the
+attempt was rejected (any fatal diagnostic), which is how a caller tells "reindexed" from "kept the
+last good index".
+
 ## Proposal Lifecycle
 
 Generated meta-skills enter as proposals before becoming installed skills:

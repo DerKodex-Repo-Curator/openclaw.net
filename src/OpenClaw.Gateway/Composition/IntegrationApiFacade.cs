@@ -66,7 +66,9 @@ internal sealed class IntegrationApiFacade
                 runtime.SessionManager,
                 runtime.AgentRuntime,
                 services.GetRequiredService<ILogger<MetaInvocationService>>(),
-                services.GetService<OpenClaw.Core.Approvals.IMetaApprovalStore>()),
+                services.GetService<OpenClaw.Core.Approvals.IMetaApprovalStore>(),
+                services.GetService<OpenClaw.Core.Skills.SkillIndexCompiler>(),
+                startup.Config.Skills),
             services.GetService<IGoalService>());
     }
 

@@ -12,6 +12,12 @@ public sealed record HealthResponse
 {
     public required string Status { get; init; }
     public long Uptime { get; init; }
+
+    /// <summary>
+    /// Skill index state. Only <c>/health/ready</c> populates it; liveness keeps reporting the
+    /// process, not the workloads inside it.
+    /// </summary>
+    public SkillIndexHealth? Skills { get; init; }
 }
 
 // ── OpenAI Chat Completions (P1) ───────────────────────────────────────

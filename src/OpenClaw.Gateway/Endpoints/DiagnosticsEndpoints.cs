@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Logging.Abstractions;
 using OpenClaw.Core.Abstractions;
 using OpenClaw.Core.Models;
+using OpenClaw.Core.Skills;
 using OpenClaw.Core.Validation;
 using OpenClaw.Gateway.Bootstrap;
 using OpenClaw.Gateway.Composition;
@@ -47,14 +48,14 @@ internal static class DiagnosticsEndpoints
 
         // Unauthenticated readiness probe: the runtime is initialized and can serve traffic.
         // Does not leak config. Returns 503 if the session manager is missing or an internal error occurs.
-        app.MapGet("/health/ready", () =>
+        // Also reports the skill index: an unpublished index is a deployment fault (503), while a
+        // degraded one is a warning that only fails the probe when FailOnDegradedSkills is set.
+        app.MapGet("/health/ready", (HttpContext ctx) =>
         {
             try
             {
                 _ = runtime.SessionManager.ActiveCount;
-                return Results.Json(
-                    new HealthResponse { Status = "ready", Uptime = Environment.TickCount64 },
-                    CoreJsonContext.Default.HealthResponse);
+                return SkillIndexHandlers.Readiness(ctx, startup.Config.Skills.FailOnDegradedSkills);
             }
             catch
             {

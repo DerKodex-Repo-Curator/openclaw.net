@@ -59,7 +59,8 @@ public sealed class NativeAgentRuntimeFactory : IAgentRuntimeFactory
             goalService: context.Services.GetService(typeof(OpenClaw.Core.Abstractions.IGoalService)) as OpenClaw.Core.Abstractions.IGoalService,
             interceptors: context.Interceptors,
             capabilitySlotExecutor: context.CapabilitySlotExecutor,
-            metaApprovals: context.Services.GetService(typeof(OpenClaw.Core.Approvals.IMetaApprovalStore)) as OpenClaw.Core.Approvals.IMetaApprovalStore);
+            metaApprovals: context.Services.GetService(typeof(OpenClaw.Core.Approvals.IMetaApprovalStore)) as OpenClaw.Core.Approvals.IMetaApprovalStore,
+            skillIndexCompiler: context.SkillIndexCompiler);
 
     public IAgentRuntime Create(AgentRuntimeFactoryContext context)
     {

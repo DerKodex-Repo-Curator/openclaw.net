@@ -162,5 +162,6 @@ internal static partial class AdminEndpoints
         MapExternalCliEndpoints(app, services);
         MapPluginAndChannelEndpoints(app, services);
         MapMetaInvocationEndpoints(app, services);
+        MapSkillIndexEndpoints(app, services);
     }
 }

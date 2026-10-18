@@ -136,6 +136,52 @@ Two flags exist because the journal is honest about what it cannot observe:
 
 A run with no journal at all — it predates this feature, or the file was lost — answers with a timeline derived from the run record and `synthetic: true` on the whole page, instead of an empty list. A journal write failure never rolls back a state transition: the run is marked `EventsGap` and the read side reports `gap`.
 
+## Skill index (read-only)
+
+The gateway compiles every visible skill into one versioned index and serves MetaSkill invocations
+from it. Two things follow for integration callers:
+
+```http
+GET /api/integration/skill-index
+Authorization: Bearer <operator-token>
+# scope: integration.read
+```
+
+```json
+{
+  "version": 12,
+  "fingerprint": "sha256:...",
+  "compiledAtUtc": "2026-10-17T09:12:03Z",
+  "ready": true,
+  "state": "degraded",
+  "lastAttemptVersion": 13,
+  "skills": [
+    { "name": "incident-review", "kind": "meta", "source": "workspace", "status": "ready" },
+    { "name": "broken-skill", "kind": "unknown", "source": "unknown", "status": "invalid", "diagnosticCode": "parse_failed" }
+  ],
+  "diagnostics": [
+    { "path": "/srv/skills/broken-skill/SKILL.md", "code": "parse_failed", "message": "...", "fatal": true }
+  ]
+}
+```
+
+- `version` is the published version. `lastAttemptVersion` is newer when the most recent compile was
+  **rejected**: a rejected attempt never replaces the active index (last known good), it only adds
+  diagnostics. Comparing the two is how you tell "reloaded" from "kept the previous index".
+- `state` is `unready` (`version == 0`, nothing usable has ever been published), `degraded` (usable,
+  but the latest attempt reported diagnostics) or `ready`.
+- `status` per skill is `ready`, `invalid` (the skill directory exists but its `SKILL.md` could not
+  be parsed — the name is taken from the directory) or `disabled` (turned off by config).
+
+**Calling during a bad index.** While the index is unready, a MetaSkill invocation answers
+`503` with `{"success": false, "error": "skills.not_ready"}` and creates no invocation record, so a
+retry with the same `Idempotency-Key` is still clean once the index recovers. `Skills.FailClosedOnUnreadyIndex`
+(default `true`) controls that; with `false` the call proceeds as it did before the index existed.
+
+Every meta-invocation response also carries `X-OpenClaw-Skill-Index` (`ready`, `degraded` or
+`unready`), so a caller that was allowed to run against a degraded index can record why. `GET
+/health/ready` reports the same state in a `skills` section and returns `503` while unready.
+
 ## Idempotency and Recovery
 
 Invocation claims and terminal results are stored under the configured Gateway `Memory.StoragePath`. `Gateway.MetaInvocations.RetentionDays` controls how long completed and uncertain records are retained; it defaults to `30` days. A record's event journal is deleted together with the record, so an expired run does not leave an orphaned `meta-invocations/*.events.ndjson` behind. Set retention to at least the longest retry window of any caller, including the DrasiWake outbox, so an old retry cannot outlive its deduplication record.

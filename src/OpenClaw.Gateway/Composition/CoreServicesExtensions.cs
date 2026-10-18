@@ -297,6 +297,15 @@ internal static class CoreServicesExtensions
         services.AddHostedService(sp => sp.GetRequiredService<SqliteEmbeddingBackfillService>());
         services.AddSingleton<IAgentRuntimeFactory, NativeAgentRuntimeFactory>();
 
+        // B4: the compiler is a singleton because it is the single writer of the skill index. The
+        // composition root resolves it during runtime initialization and compiles synchronously
+        // before the runtime exists; the hosted-service hook only covers hosts that do not use that
+        // path (its StartAsync is a no-op once a version has been published).
+        services.AddSingleton(sp => new OpenClaw.Core.Skills.SkillIndexCompiler(
+            config.Skills,
+            sp.GetRequiredService<ILogger<OpenClaw.Core.Skills.SkillIndexCompiler>>()));
+        services.AddHostedService(sp => sp.GetRequiredService<OpenClaw.Core.Skills.SkillIndexCompiler>());
+
         return services;
     }
 
