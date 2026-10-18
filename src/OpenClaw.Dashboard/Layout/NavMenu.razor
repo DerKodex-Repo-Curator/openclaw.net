@@ -60,6 +60,11 @@
             @L["nav.sessions"]
         </MudNavLink>
 
+        @* Read-only run view: a Viewer may read it, so it sits outside the operator block. *@
+        <MudNavLink Href="runs" Icon="@Icons.Material.Filled.Timeline">
+            @L["nav.runs"]
+        </MudNavLink>
+
         @if (Auth.HasRole("admin"))
         {
             <MudNavLink Href="settings" Icon="@Icons.Material.Filled.Settings">

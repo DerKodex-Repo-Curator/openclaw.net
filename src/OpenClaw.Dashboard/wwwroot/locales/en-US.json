@@ -57,7 +57,8 @@
     "settings": "Settings",
     "channels": "Channels",
     "whatsapp": "WhatsApp",
-    "skillsCost": "Skills Cost"
+    "skillsCost": "Skills Cost",
+    "runs": "Runs"
   },
   "auth": {
     "login": "Login",
@@ -501,6 +502,54 @@
       "index": "Index chars",
       "savedPct": "Saved %",
       "status": "Status"
+    }
+  },
+  "runs": {
+    "title": "Runs",
+    "subtitle": "Run view: pause reasons, step timeline, live tail",
+    "list": "Runs",
+    "timeline": "Timeline",
+    "selectRun": "Pick a run on the left to see its timeline",
+    "empty": "No runs recorded yet",
+    "loadMore": "Load more",
+    "session": "Session",
+    "step": "Step",
+    "detail": "Detail",
+    "pauseReason": "Pause reason",
+    "pauseStep": "Paused on",
+    "reasonUserInput": "Waiting for user input",
+    "reasonToolApproval": "Waiting for tool approval",
+    "noPause": "—",
+    "openSessions": "Resolve in Sessions",
+    "synthetic": "Derived",
+    "syntheticHint": "These events were derived from the run record, not observed live; the timestamps are observation times, not step durations.",
+    "gap": "Timeline may be missing events",
+    "gapHint": "This run's journal has unreadable lines or could not be written, so the timeline is incomplete.",
+    "liveOn": "Live",
+    "liveOff": "Disconnected",
+    "terminal": "Finished",
+    "error": "Error",
+    "filter": {
+      "all": "All",
+      "running": "Running",
+      "paused": "Paused",
+      "completed": "Completed",
+      "failed": "Failed",
+      "uncertain": "Uncertain"
+    },
+    "kind": {
+      "claim": "Claimed",
+      "resume.requested": "Resume requested",
+      "resumed": "Resumed",
+      "step.started": "Step started",
+      "step.completed": "Step completed",
+      "step.failed": "Step failed",
+      "step.paused": "Step paused",
+      "approval.requested": "Approval requested",
+      "approval.decided": "Approval decided",
+      "completed": "Completed",
+      "failed": "Failed",
+      "uncertain": "Uncertain"
     }
   }
 }

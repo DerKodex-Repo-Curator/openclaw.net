@@ -17,6 +17,8 @@ builder.Services.AddScoped<LocalizationService>();
 builder.Services.AddScoped<ApiService>();
 builder.Services.AddScoped<AuthService>();
 builder.Services.AddScoped<EventStreamService>();
+// B3 run view: a separate client because it needs `id:` frames and the `terminal` frame.
+builder.Services.AddScoped<RunEventStream>();
 
 builder.Services.AddScoped(sp => new HttpClient { BaseAddress = new Uri(builder.HostEnvironment.BaseAddress) });
 

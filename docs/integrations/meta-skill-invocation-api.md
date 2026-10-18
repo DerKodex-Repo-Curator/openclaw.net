@@ -106,9 +106,39 @@ Configuration (`OpenClaw:Integration:MetaApprovals`):
 
 **Boundary with the interactive approval API.** `/api/integration/meta-approvals` is machine-facing and belongs to integration callers (the DrasiWake path). The interactive chat surfaces keep using their own `/api/approvals` endpoints, which gate live user turns for a human at the keyboard. Do not point automation at `/api/approvals`, and do not expect the integration endpoints to surface interactive prompts.
 
+## Run visibility (read-only)
+
+Every invocation keeps a journal of what happened to it, and three `GET` endpoints expose it. All three are pure reads — there is no resume, cancel or approve here — and the identical handlers are also mounted on `/admin/meta-invocations*` for the operator dashboard (`/runs`). Integration callers use the machine face below; the two faces return byte-identical payloads.
+
+```http
+GET /api/integration/meta-invocations?status=&sessionId=&limit=&cursor=
+GET /api/integration/meta-invocations/{invocationId}/events?after=&limit=
+GET /api/integration/meta-invocations/{invocationId}/events/stream?after=
+Authorization: Bearer <operator-token>
+```
+
+| Endpoint | Behaviour |
+| --- | --- |
+| `GET /api/integration/meta-invocations` | Keyset page of the caller's own runs, newest first. `status` accepts `Running`, `AwaitingInput`, `Completed`, `Uncertain`; `limit` defaults to `50` and caps at `200`. Pass the returned `nextCursor` back as `cursor` for the next page — pages never repeat or skip a row. A malformed cursor returns `400 runs.cursor_invalid`, so discard it and restart from the first page. |
+| `GET .../{invocationId}/events` | One page of events: `events`, `nextSeq`, `terminal`, `gap`, `synthetic`. `after` is exclusive; `nextSeq` is the highest sequence you may pass, and a larger `after` returns `400 events.after_invalid`. `limit` defaults to `200` and caps at `1000`. |
+| `GET .../{invocationId}/events/stream` | Server-sent events. Each frame is `event: run_event` with `id: <seq>` and the event JSON as `data:`; the last frame is `event: terminal`, after which the server closes the stream. Reconnect with `Last-Event-ID` set to the last `seq` you processed and you receive exactly the events you missed. `Last-Event-ID` takes precedence over `after`. |
+
+A run owned by another caller returns `403 invocation.forbidden`; an unknown id returns `404 invocation.not_found`. (Integration is disabled entirely on a host without the invocation store: `404 invocations.disabled`.)
+
+### Events
+
+`kind` is a closed set: `claim`, `resume.requested`, `resumed`, `step.started`, `step.completed`, `step.failed`, `step.paused`, `approval.requested`, `approval.decided`, `completed`, `failed`, `uncertain`. `seq` starts at `1` for each invocation and increases by one per event. `detail` is a short redacted label — a pause reason, an error code, a truncated approval id — and never carries step input or output.
+
+Two flags exist because the journal is honest about what it cannot observe:
+
+- `synthetic: true` — the gateway did not watch that boundary live and derived the event from the run record afterwards. Step boundaries are always synthetic (the runtime does not surface them as they happen), so the timestamps on `step.started` / `step.completed` are observation times and must not be read as durations. `step.paused` and the terminal event are real. Re-deriving the same step on a later observation does not append it twice.
+- `gap: true` — the journal has unreadable lines, or could not be written. The ledger still advanced, because the run really happened; treat the timeline as incomplete rather than retrying the invocation.
+
+A run with no journal at all — it predates this feature, or the file was lost — answers with a timeline derived from the run record and `synthetic: true` on the whole page, instead of an empty list. A journal write failure never rolls back a state transition: the run is marked `EventsGap` and the read side reports `gap`.
+
 ## Idempotency and Recovery
 
-Invocation claims and terminal results are stored under the configured Gateway `Memory.StoragePath`. `Gateway.MetaInvocations.RetentionDays` controls how long completed and uncertain records are retained; it defaults to `30` days. Set it to at least the longest retry window of any caller, including the DrasiWake outbox, so an old retry cannot outlive its deduplication record.
+Invocation claims and terminal results are stored under the configured Gateway `Memory.StoragePath`. `Gateway.MetaInvocations.RetentionDays` controls how long completed and uncertain records are retained; it defaults to `30` days. A record's event journal is deleted together with the record, so an expired run does not leave an orphaned `meta-invocations/*.events.ndjson` behind. Set retention to at least the longest retry window of any caller, including the DrasiWake outbox, so an old retry cannot outlive its deduplication record.
 
 If execution fails, is cancelled, or a process stops before persisting a terminal result, the invocation is marked `Uncertain`. An uncertain invocation is not automatically retried; the caller or operator must reconcile its outcome before choosing how to proceed. Retrying the same key reports the stored uncertain state.
 

@@ -1075,6 +1075,23 @@ internal static class IntegrationEndpoints
                 CoreJsonContext.Default.IntegrationMessageResponse,
                 statusCode: StatusCodes.Status202Accepted);
         });
+
+        // B3 run events, machine face. The same handlers are mounted on the operator face in
+        // AdminEndpoints.MetaInvocations.cs; mounting them through one helper is what keeps the two
+        // responses byte-identical (T-B3-11).
+        MetaRunEventEndpoints.MapMetaInvocationEndpoints(
+            group,
+            "/meta-invocations",
+            ctx =>
+            {
+                var failure = AuthorizeAndConsume(
+                    ctx, startup, runtime, browserSessions, endpointScope: "integration.read", requireCsrf: false);
+                if (failure is not null)
+                    return (default, failure);
+
+                var caller = EndpointHelpers.ResolveCaller(ctx, startup);
+                return (new MetaRunCaller(caller.AccountId ?? "bootstrap", caller.IsAdmin), null);
+            });
     }
 
     private static PaymentExecutionContext BuildPaymentContext(HttpContext ctx, GatewayConfig config)

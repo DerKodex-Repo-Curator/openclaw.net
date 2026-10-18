@@ -1,0 +1,618 @@
+@page "/runs"
+@implements IDisposable
+@inject ApiService Api
+@inject LocalizationService L
+@inject AuthService Auth
+@inject RunEventStream Stream
+
+<PageTitle>@L["runs.title"] · OpenClaw</PageTitle>
+
+@if (!Auth.HasRole("viewer"))
+{
+    <MudPaper Class="pa-8 d-flex flex-column align-center" Elevation="0">
+        <MudIcon Icon="@Icons.Material.Filled.Lock" Size="Size.Large" Color="Color.Warning" />
+        <MudText Typo="Typo.h6" Class="mt-4">@L["auth.notAuthenticated"]</MudText>
+    </MudPaper>
+}
+else
+{
+    <div class="runs-shell">
+        <header class="runs-header">
+            <div>
+                <div class="runs-eyebrow">// RUN VIEW</div>
+                <MudText Typo="Typo.h4" Class="runs-title">@L["runs.title"]</MudText>
+                <MudText Typo="Typo.body2" Class="runs-subtitle">@L["runs.subtitle"]</MudText>
+            </div>
+            <div class="runs-header-actions">
+                <MudTooltip Text="@L["common.refresh"]">
+                    <MudIconButton Icon="@Icons.Material.Filled.Refresh"
+                                   Color="Color.Primary"
+                                   Disabled="@_loading"
+                                   OnClick="@(() => LoadRunsAsync(false))" />
+                </MudTooltip>
+            </div>
+        </header>
+
+        <div class="runs-filters">
+            @foreach (var filter in Filters)
+            {
+                <MudChip T="string"
+                         Size="Size.Small"
+                         Color="@(_filter == filter ? Color.Primary : Color.Default)"
+                         Variant="@(_filter == filter ? Variant.Filled : Variant.Outlined)"
+                         OnClick="@(() => SetFilterAsync(filter))">
+                    @FilterLabel(filter)
+                </MudChip>
+            }
+        </div>
+
+        <div class="runs-grid">
+            <MudPaper Class="runs-list-panel" Elevation="0">
+                <div class="runs-panel-head">
+                    <MudText Typo="Typo.caption" Class="runs-panel-title">@L["runs.list"]</MudText>
+                    <MudText Typo="Typo.caption" Class="runs-count">@_runs.Count</MudText>
+                </div>
+
+                @if (_loading && _runs.Count == 0)
+                {
+                    <MudSkeleton SkeletonType="SkeletonType.Rectangle" Height="240px" />
+                }
+                else if (_runs.Count == 0)
+                {
+                    <EmptyHint Icon="@Icons.Material.Filled.HourglassEmpty"
+                               Title="@L["common.noData"]"
+                               Subtitle="@L["runs.empty"]" />
+                }
+                else
+                {
+                    foreach (var group in Groups())
+                    {
+                        <div class="runs-group">
+                            <div class="runs-group-head">
+                                <span class="runs-group-label">@FilterLabel(group.Key)</span>
+                                <span class="runs-group-count">@group.Runs.Count</span>
+                            </div>
+                            @foreach (var run in group.Runs)
+                            {
+                                <button type="button"
+                                        class="runs-row @(run.InvocationId == _selectedId ? "runs-row-active" : "")"
+                                        @onclick="@(() => SelectAsync(run))">
+                                    <div class="runs-row-main">
+                                        <span class="runs-row-skill">@(string.IsNullOrWhiteSpace(run.Skill) ? "—" : run.Skill)</span>
+                                        <span class="runs-row-id">@ShortId(run.InvocationId)</span>
+                                    </div>
+                                    <div class="runs-row-meta">
+                                        <span>@FormatTime(run.CreatedAtUtc)</span>
+                                        @if (!string.IsNullOrWhiteSpace(run.PauseStepId))
+                                        {
+                                            <span class="runs-row-pause">@run.PauseStepId</span>
+                                        }
+                                    </div>
+                                </button>
+                            }
+                        </div>
+                    }
+
+                    @if (_nextCursor is not null)
+                    {
+                        <MudButton Variant="Variant.Text"
+                                   Size="Size.Small"
+                                   Color="Color.Primary"
+                                   Disabled="@_loadingMore"
+                                   OnClick="@(() => LoadRunsAsync(true))">
+                            @L["runs.loadMore"]
+                        </MudButton>
+                    }
+                }
+            </MudPaper>
+
+            <MudPaper Class="runs-timeline-panel" Elevation="0">
+                @if (_selected is null)
+                {
+                    <EmptyHint Icon="@Icons.Material.Filled.Timeline"
+                               Title="@L["runs.timeline"]"
+                               Subtitle="@L["runs.selectRun"]" />
+                }
+                else
+                {
+                    <div class="runs-panel-head">
+                        <div>
+                            <MudText Typo="Typo.subtitle1" Class="runs-timeline-title">
+                                @(string.IsNullOrWhiteSpace(_selected.Skill) ? "—" : _selected.Skill)
+                            </MudText>
+                            <MudText Typo="Typo.caption" Class="runs-timeline-meta">
+                                @ShortId(_selected.InvocationId)
+                                @if (!string.IsNullOrWhiteSpace(_selected.SessionId))
+                                {
+                                    <span> · @L["runs.session"] @_selected.SessionId</span>
+                                }
+                            </MudText>
+                        </div>
+                        <div class="runs-timeline-status">
+                            <MudChip T="string" Size="Size.Small" Color="@StatusColor(_selected.Status)">
+                                @StatusLabel(_selected.Status)
+                            </MudChip>
+                            @if (_terminal)
+                            {
+                                <span class="runs-live runs-live-off">@L["runs.terminal"]</span>
+                            }
+                            else
+                            {
+                                <span class="runs-live @(_live ? "runs-live-on" : "runs-live-off")">
+                                    @(_live ? L["runs.liveOn"] : L["runs.liveOff"])
+                                </span>
+                            }
+                        </div>
+                    </div>
+
+                    @if (_selected.Status == "AwaitingInput")
+                    {
+                        <MudAlert Severity="Severity.Warning" Variant="Variant.Outlined" Class="my-3" Dense="true">
+                            <div class="runs-pause">
+                                <div>
+                                    <strong>@L["runs.pauseReason"]:</strong> @PauseReasonLabel(_selected.PauseReason)
+                                    @if (!string.IsNullOrWhiteSpace(_selected.PauseStepId))
+                                    {
+                                        <span> · <strong>@L["runs.pauseStep"]:</strong> <code>@_selected.PauseStepId</code></span>
+                                    }
+                                </div>
+                                <MudButton Href="sessions"
+                                           Size="Size.Small"
+                                           Variant="Variant.Text"
+                                           Color="Color.Warning"
+                                           EndIcon="@Icons.Material.Filled.ArrowForward">
+                                    @L["runs.openSessions"]
+                                </MudButton>
+                            </div>
+                        </MudAlert>
+                    }
+
+                    @if (!string.IsNullOrWhiteSpace(_selected.Error))
+                    {
+                        <MudAlert Severity="Severity.Error" Variant="Variant.Outlined" Class="my-3" Dense="true">
+                            <strong>@L["runs.error"]:</strong> <code>@_selected.Error</code>
+                        </MudAlert>
+                    }
+
+                    @if (_gap)
+                    {
+                        <MudAlert Severity="Severity.Info" Variant="Variant.Outlined" Class="my-3" Dense="true">
+                            <strong>@L["runs.gap"]</strong> — @L["runs.gapHint"]
+                        </MudAlert>
+                    }
+
+                    @if (_synthetic)
+                    {
+                        <MudAlert Severity="Severity.Info" Variant="Variant.Outlined" Class="my-3" Dense="true">
+                            <strong>@L["runs.synthetic"]</strong> — @L["runs.syntheticHint"]
+                        </MudAlert>
+                    }
+
+                    @if (_timelineLoading)
+                    {
+                        <MudProgressLinear Indeterminate="true" Color="Color.Primary" Class="my-4" />
+                    }
+                    else if (_events.Count == 0)
+                    {
+                        <EmptyHint Icon="@Icons.Material.Filled.HourglassEmpty"
+                                   Title="@L["common.noData"]"
+                                   Subtitle="@L["runs.timeline"]" />
+                    }
+                    else
+                    {
+                        <div class="runs-timeline">
+                            @foreach (var runEvent in _events)
+                            {
+                                <div class="runs-event @(runEvent.Synthetic ? "runs-event-synthetic" : null)">
+                                    <div class="runs-event-rail">
+                                        <span class="runs-event-dot" data-kind="@runEvent.Kind"></span>
+                                    </div>
+                                    <div class="runs-event-body">
+                                        <div class="runs-event-head">
+                                            <span class="runs-seq">#@runEvent.Seq</span>
+                                            <span class="runs-kind">@KindLabel(runEvent.Kind)</span>
+                                            @if (runEvent.Synthetic)
+                                            {
+                                                <span class="runs-flag">@L["runs.synthetic"]</span>
+                                            }
+                                            <span class="runs-at">@FormatTime(runEvent.AtUtc)</span>
+                                        </div>
+                                        @if (!string.IsNullOrWhiteSpace(runEvent.StepId) ||
+                                             !string.IsNullOrWhiteSpace(runEvent.Detail))
+                                        {
+                                            <div class="runs-event-meta">
+                                                @if (!string.IsNullOrWhiteSpace(runEvent.StepId))
+                                                {
+                                                    <span>@L["runs.step"] <code>@runEvent.StepId</code></span>
+                                                }
+                                                @if (!string.IsNullOrWhiteSpace(runEvent.Detail))
+                                                {
+                                                    <span>@L["runs.detail"] <code>@runEvent.Detail</code></span>
+                                                }
+                                            </div>
+                                        }
+                                    </div>
+                                </div>
+                            }
+                        </div>
+                    }
+                }
+            </MudPaper>
+        </div>
+    </div>
+
+    <style>
+        .runs-shell { display: flex; flex-direction: column; gap: 18px; }
+        .runs-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+        .runs-eyebrow {
+            font-family: "JetBrains Mono", monospace; font-size: 11px; letter-spacing: .18em;
+            text-transform: uppercase; color: var(--muted-soft); margin-bottom: 6px;
+        }
+        .runs-title { color: var(--text-strong); font-family: "Bricolage Grotesque", sans-serif; }
+        .runs-subtitle { color: var(--muted); margin-top: 4px; }
+        .runs-filters { display: flex; flex-wrap: wrap; gap: 8px; }
+        .runs-grid { display: grid; grid-template-columns: minmax(280px, 1fr) minmax(0, 2fr); gap: 16px; align-items: start; }
+        @@media (max-width: 900px) { .runs-grid { grid-template-columns: minmax(0, 1fr); } }
+        .runs-list-panel, .runs-timeline-panel {
+            background: var(--panel); border: 1px solid var(--border-soft);
+            border-radius: var(--radius-md); padding: 14px; min-height: 240px;
+        }
+        .runs-timeline-panel { max-height: 74vh; overflow-y: auto; }
+        .runs-panel-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+        .runs-panel-title { color: var(--muted); letter-spacing: .12em; text-transform: uppercase; }
+        .runs-count { color: var(--accent-hot); font-family: "JetBrains Mono", monospace; }
+        .runs-group { margin-bottom: 14px; }
+        .runs-group-head { display: flex; align-items: center; justify-content: space-between; padding: 0 2px 6px; }
+        .runs-group-label { font-size: 11px; letter-spacing: .14em; text-transform: uppercase; color: var(--muted-soft); }
+        .runs-group-count { font-size: 11px; color: var(--muted-soft); font-family: "JetBrains Mono", monospace; }
+        .runs-row {
+            display: flex; flex-direction: column; gap: 4px; width: 100%; text-align: left;
+            padding: 9px 10px; margin-bottom: 4px; cursor: pointer;
+            background: transparent; border: 1px solid transparent; border-radius: var(--radius-sm);
+            color: var(--text); transition: background .12s ease, border-color .12s ease;
+        }
+        .runs-row:hover { background: var(--panel-soft); border-color: var(--border-soft); }
+        .runs-row-active { background: rgba(139, 92, 246, .12); border-color: var(--border-bold); }
+        .runs-row-main { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+        .runs-row-skill { font-weight: 600; font-size: 13px; }
+        .runs-row-id { font-family: "JetBrains Mono", monospace; font-size: 11px; color: var(--muted-soft); }
+        .runs-row-meta { display: flex; gap: 10px; font-size: 11px; color: var(--muted-soft); }
+        .runs-row-pause { color: var(--signal-warn); }
+        .runs-timeline-title { color: var(--text-strong); }
+        .runs-timeline-meta { color: var(--muted); font-family: "JetBrains Mono", monospace; }
+        .runs-timeline-status { display: flex; align-items: center; gap: 10px; }
+        .runs-live { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; }
+        .runs-live-on { color: var(--signal-ok); }
+        .runs-live-off { color: var(--muted-soft); }
+        .runs-pause { display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; }
+        .runs-timeline { display: flex; flex-direction: column; gap: 2px; }
+        .runs-event { display: grid; grid-template-columns: 22px minmax(0, 1fr); gap: 8px; padding: 7px 0; }
+        .runs-event-rail { position: relative; display: flex; justify-content: center; }
+        .runs-event-rail::before {
+            content: ""; position: absolute; top: 0; bottom: -14px; width: 1px; background: var(--border-soft);
+        }
+        .runs-event:last-child .runs-event-rail::before { display: none; }
+        .runs-event-dot {
+            position: relative; z-index: 1; width: 8px; height: 8px; margin-top: 6px; border-radius: 50%;
+            background: var(--accent); box-shadow: 0 0 0 3px rgba(139, 92, 246, .16);
+        }
+        .runs-event-dot[data-kind="step.paused"] { background: var(--signal-warn); box-shadow: 0 0 0 3px rgba(251, 191, 36, .16); }
+        .runs-event-dot[data-kind="approval.requested"] { background: var(--signal-warn); }
+        .runs-event-dot[data-kind="completed"] { background: var(--signal-ok); box-shadow: 0 0 0 3px rgba(52, 211, 153, .16); }
+        .runs-event-dot[data-kind="failed"] { background: var(--signal-err); box-shadow: 0 0 0 3px rgba(248, 113, 113, .16); }
+        .runs-event-dot[data-kind="uncertain"] { background: var(--signal-err); }
+        .runs-event-synthetic .runs-event-dot { background: var(--muted-soft); box-shadow: none; }
+        .runs-event-head { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+        .runs-seq { font-family: "JetBrains Mono", monospace; font-size: 11px; color: var(--muted-soft); }
+        .runs-kind { font-size: 13px; font-weight: 600; color: var(--text); }
+        .runs-flag {
+            font-size: 10px; letter-spacing: .1em; text-transform: uppercase;
+            padding: 1px 6px; border-radius: 999px;
+            border: 1px solid var(--border); color: var(--muted);
+        }
+        .runs-at { margin-left: auto; font-family: "JetBrains Mono", monospace; font-size: 11px; color: var(--muted-soft); }
+        .runs-event-meta { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 3px; font-size: 11px; color: var(--muted); }
+        .runs-event-meta code { font-family: "JetBrains Mono", monospace; color: var(--accent-hot); }
+    </style>
+}
+
+@code {
+    private static readonly string[] Filters = ["all", "running", "paused", "failed", "completed", "uncertain"];
+
+    private List<RunSummaryDto> _runs = [];
+    private string? _nextCursor;
+    private bool _loading;
+    private bool _loadingMore;
+    private string _filter = "all";
+
+    private RunSummaryDto? _selected;
+    private Guid? _selectedId;
+    private List<RunEventDto> _events = [];
+    private bool _timelineLoading;
+    private bool _gap;
+    private bool _synthetic;
+    private bool _terminal;
+    private bool _live;
+
+    protected override void OnInitialized()
+    {
+        L.OnLanguageChanged += HandleLanguageChanged;
+    }
+
+    protected override async Task OnInitializedAsync()
+    {
+        if (Auth.HasRole("viewer"))
+        {
+            await LoadRunsAsync(false);
+        }
+    }
+
+    private void HandleLanguageChanged() => InvokeAsync(StateHasChanged);
+
+    private async Task SetFilterAsync(string filter)
+    {
+        if (_filter == filter)
+        {
+            return;
+        }
+
+        _filter = filter;
+        await LoadRunsAsync(false);
+    }
+
+    private async Task LoadRunsAsync(bool append)
+    {
+        if (append)
+        {
+            _loadingMore = true;
+        }
+        else
+        {
+            _loading = true;
+        }
+
+        try
+        {
+            var url = "/admin/meta-invocations?limit=50";
+            if (StatusForFilter(_filter) is { } status)
+            {
+                url += $"&status={status}";
+            }
+
+            if (append && _nextCursor is not null)
+            {
+                url += $"&cursor={Uri.EscapeDataString(_nextCursor)}";
+            }
+
+            var page = await Api.GetAsync<RunListDto>(url);
+            var items = page?.Items ?? new List<RunSummaryDto>();
+            if (append)
+            {
+                _runs.AddRange(items);
+            }
+            else
+            {
+                _runs = items;
+                _nextCursor = null;
+            }
+
+            // Completed and Failed share one ledger status, so the split happens here and not in
+            // the query: the server would have to know a UI grouping to do it for us.
+            if (_filter is "completed" or "failed")
+            {
+                _runs = _runs.Where(MatchesFilter).ToList();
+            }
+
+            _nextCursor = page?.NextCursor;
+        }
+        catch (Exception)
+        {
+            // A failed list load must not blank out a timeline the operator is already reading.
+            if (!append)
+            {
+                _runs = [];
+            }
+        }
+        finally
+        {
+            _loading = false;
+            _loadingMore = false;
+        }
+    }
+
+    private async Task SelectAsync(RunSummaryDto run)
+    {
+        await StopStreamAsync();
+
+        _selected = run;
+        _selectedId = run.InvocationId;
+        _events = [];
+        _gap = false;
+        _synthetic = false;
+        _terminal = false;
+        _live = false;
+        _timelineLoading = true;
+
+        try
+        {
+            var page = await Api.GetAsync<RunEventPageDto>(
+                $"/admin/meta-invocations/{run.InvocationId:D}/events?limit={TimelinePageSize}");
+
+            if (page is not null)
+            {
+                _events = [.. page.Events];
+                _gap = page.Gap;
+                _synthetic = page.Synthetic;
+                _terminal = page.Terminal;
+            }
+        }
+        catch (Exception)
+        {
+            _terminal = false;
+        }
+        finally
+        {
+            _timelineLoading = false;
+        }
+
+        if (_terminal)
+        {
+            return;
+        }
+
+        // Tail from the last seq the page delivered, so the stream never repeats the first screen.
+        await Stream.StartAsync(
+            run.InvocationId,
+            _events.Count == 0 ? 0 : _events[^1].Seq,
+            OnStreamEventAsync,
+            OnStreamTerminalAsync,
+            OnStreamConnectionAsync);
+    }
+
+    private const int TimelinePageSize = 200;
+
+    private Task OnStreamEventAsync(RunEventDto runEvent) => InvokeAsync(() =>
+    {
+        if (_events.Any(existing => existing.Seq == runEvent.Seq))
+        {
+            return;
+        }
+
+        _events.Add(runEvent);
+        if (runEvent.Synthetic)
+        {
+            _synthetic = true;
+        }
+
+        StateHasChanged();
+    });
+
+    private Task OnStreamTerminalAsync(RunTerminalDto terminal) => InvokeAsync(() =>
+    {
+        _terminal = true;
+        _live = false;
+
+        // Reflect the terminal status on the row we are showing, without a second round trip.
+        var selected = _selected;
+        if (selected is not null && !string.IsNullOrWhiteSpace(terminal.Status))
+        {
+            selected.Status = terminal.Status;
+            var index = _runs.FindIndex(run => run.InvocationId == selected.InvocationId);
+            if (index >= 0)
+            {
+                _runs[index] = selected;
+            }
+        }
+
+        StateHasChanged();
+    });
+
+    private Task OnStreamConnectionAsync(bool connected) => InvokeAsync(() =>
+    {
+        _live = connected;
+        StateHasChanged();
+    });
+
+    private async Task StopStreamAsync()
+    {
+        _live = false;
+        await Stream.StopAsync();
+    }
+
+    private IEnumerable<RunGroup> Groups()
+    {
+        foreach (var bucket in new[] { "running", "paused", "failed", "completed", "uncertain" })
+        {
+            var runs = _runs.Where(run => BucketOf(run) == bucket).ToList();
+            if (runs.Count > 0)
+            {
+                yield return new RunGroup(bucket, runs);
+            }
+        }
+    }
+
+    private bool MatchesFilter(RunSummaryDto run) => _filter switch
+    {
+        "completed" => BucketOf(run) == "completed",
+        "failed" => BucketOf(run) == "failed",
+        _ => true
+    };
+
+    private static string? StatusForFilter(string filter) => filter switch
+    {
+        "running" => "Running",
+        "paused" => "AwaitingInput",
+        "uncertain" => "Uncertain",
+        "completed" or "failed" => "Completed",
+        _ => null
+    };
+
+    /// <summary>
+    /// The ledger has four statuses; operators think in five. "Failed" is a completed run that
+    /// carries an error, which is why it is a view concern and not a query parameter.
+    /// </summary>
+    private static string BucketOf(RunSummaryDto run) => run.Status switch
+    {
+        "Running" => "running",
+        "AwaitingInput" => "paused",
+        "Uncertain" => "uncertain",
+        "Completed" => string.IsNullOrWhiteSpace(run.Error) ? "completed" : "failed",
+        _ => "completed"
+    };
+
+    private string FilterLabel(string key) => L[$"runs.filter.{key}"];
+
+    private string StatusLabel(string status) => status switch
+    {
+        "Running" => L["runs.filter.running"],
+        "AwaitingInput" => L["runs.filter.paused"],
+        "Completed" => L["runs.filter.completed"],
+        "Uncertain" => L["runs.filter.uncertain"],
+        _ => status
+    };
+
+    private string PauseReasonLabel(string? reason) => reason switch
+    {
+        null or "" => L["runs.noPause"],
+        "user_input" => L["runs.reasonUserInput"],
+        "tool_approval" => L["runs.reasonToolApproval"],
+        _ => reason
+    };
+
+    /// <summary>
+    /// Kind labels are optional by design: a kind the server adds later must render as its raw
+    /// name, not as a missing-key placeholder.
+    /// </summary>
+    private string KindLabel(string kind)
+    {
+        var key = $"runs.kind.{kind}";
+        var label = L[key];
+        return string.Equals(label, key, StringComparison.Ordinal) ? kind : label;
+    }
+
+    private static Color StatusColor(string status) => status switch
+    {
+        "Running" => Color.Primary,
+        "AwaitingInput" => Color.Warning,
+        "Completed" => Color.Success,
+        "Uncertain" => Color.Error,
+        _ => Color.Default
+    };
+
+    private static string ShortId(Guid id)
+    {
+        var text = id.ToString("N");
+        return "…" + text[^8..];
+    }
+
+    private static string FormatTime(DateTimeOffset atUtc)
+        => atUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss");
+
+    private sealed record RunGroup(string Key, List<RunSummaryDto> Runs);
+
+    public void Dispose()
+    {
+        L.OnLanguageChanged -= HandleLanguageChanged;
+        _ = Stream.StopAsync();
+    }
+}

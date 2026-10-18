@@ -45,7 +45,13 @@ public sealed class MetaInvocationService(
             request,
             MetaInvocationJsonContext.Default.MetaSkillInvocationRequest);
         var requestHash = Convert.ToHexString(SHA256.HashData(requestJson));
-        var claim = await store.BeginOrGetAsync(callerId, idempotencyKey, requestHash, cancellationToken);
+        var claim = await store.BeginOrGetAsync(
+            callerId,
+            idempotencyKey,
+            requestHash,
+            cancellationToken,
+            sessionId: request.SessionId,
+            skill: request.Skill);
 
         if (claim.Kind == MetaInvocationClaimKind.Conflict)
         {
@@ -60,9 +66,34 @@ public sealed class MetaInvocationService(
             if (resume is null || claim.Record.Status != MetaInvocationStatus.AwaitingInput)
                 return ExistingResult(claim.Record);
 
+            // Recorded before the decision is resolved: whoever reads the timeline next sees that a
+            // human (or a retrying caller) asked to continue, and whether they brought an answer.
+            await store.AppendEventAsync(
+                claim.Record.InvocationId,
+                [new MetaRunEventDraft(
+                    MetaRunEventKinds.ResumeRequested,
+                    claim.Record.Pause?.StepId,
+                    nameof(MetaInvocationStatus.AwaitingInput),
+                    resume.Inputs is null || resume.Inputs.Count == 0 ? "empty-inputs" : null)],
+                CancellationToken.None);
+
             if (claim.Record.Pause?.ApprovalId is { Length: > 0 } approvalId)
             {
                 var decision = await ResolveApprovalDecisionAsync(claim.Record, approvalId, cancellationToken);
+                if (decision != MetaApprovalDecisionKind.Pending)
+                {
+                    // The journal records the decision before the run moves, so a timeline read at
+                    // any instant explains why the run resumed (or stopped for good).
+                    await store.AppendEventAsync(
+                        claim.Record.InvocationId,
+                        [new MetaRunEventDraft(
+                            MetaRunEventKinds.ApprovalDecided,
+                            claim.Record.Pause?.StepId,
+                            nameof(MetaInvocationStatus.AwaitingInput),
+                            decision == MetaApprovalDecisionKind.Denied ? "denied" : "approved")],
+                        CancellationToken.None);
+                }
+
                 if (decision == MetaApprovalDecisionKind.Denied)
                 {
                     session.MetaExecutionCheckpoint = null;
@@ -71,7 +102,8 @@ public sealed class MetaInvocationService(
                         callerId,
                         idempotencyKey,
                         MetaApprovalErrorCodes.Denied,
-                        CancellationToken.None);
+                        CancellationToken.None,
+                        MetaRunEventComposer.DeriveStepsForTerminal(session, request.Skill));
                     var denied = await store.TryGetAsync(callerId, idempotencyKey, CancellationToken.None);
                     return new MetaInvocationExecutionResult(
                         StatusCodes.Status200OK,
@@ -140,7 +172,12 @@ public sealed class MetaInvocationService(
             if (!SessionAccess.CanWrite(session, accountId, isAdmin))
             {
                 const string denied = "Session ownership changed before invocation execution.";
-                var error = await TryMarkUncertainAsync(callerId, idempotencyKey, denied, record.InvocationId)
+                var error = await TryMarkUncertainAsync(
+                        callerId,
+                        idempotencyKey,
+                        denied,
+                        record.InvocationId,
+                        MetaRunEventComposer.DeriveStepsForTerminal(session, request.Skill))
                     ? denied
                     : $"{denied} Invocation state could not be persisted.";
                 return new MetaInvocationExecutionResult(
@@ -149,6 +186,19 @@ public sealed class MetaInvocationService(
             }
 
             var authenticatedUserId = session.AuthenticatedUserId;
+            if (wasPaused)
+            {
+                // The run is about to execute again: a timeline that showed only `step.paused` would
+                // leave the reader unable to tell "still waiting" from "resumed and silently stuck".
+                await store.AppendEventAsync(
+                    record.InvocationId,
+                    [new MetaRunEventDraft(
+                        MetaRunEventKinds.Resumed,
+                        record.Pause?.StepId,
+                        nameof(MetaInvocationStatus.Running))],
+                    CancellationToken.None);
+            }
+
             string result;
             try
             {
@@ -168,7 +218,12 @@ public sealed class MetaInvocationService(
                 await sessionManager.PersistAsync(session, CancellationToken.None, sessionLockHeld: true);
                 if (pause is not null)
                 {
-                    var paused = await store.MarkAwaitingInputAsync(callerId, idempotencyKey, pause, CancellationToken.None);
+                    var paused = await store.MarkAwaitingInputAsync(
+                        callerId,
+                        idempotencyKey,
+                        pause,
+                        CancellationToken.None,
+                        MetaRunEventComposer.DeriveStepsForPause(session, request.Skill, pause.StepId));
                     logger.LogInformation(
                         "MetaSkill invocation {InvocationId} paused on step {StepId} ({Reason}); waiting for a resume.",
                         paused.InvocationId,
@@ -177,7 +232,12 @@ public sealed class MetaInvocationService(
                     return new MetaInvocationExecutionResult(StatusCodes.Status200OK, ToResponse(paused, result: null));
                 }
 
-                await store.CompleteAsync(callerId, idempotencyKey, result, CancellationToken.None);
+                await store.CompleteAsync(
+                    callerId,
+                    idempotencyKey,
+                    result,
+                    CancellationToken.None,
+                    MetaRunEventComposer.DeriveStepsForTerminal(session, request.Skill));
             }
             catch (Exception exception)
             {
@@ -185,7 +245,12 @@ public sealed class MetaInvocationService(
                     "Failed to persist the session or completed result for MetaSkill invocation {InvocationId}.",
                     record.InvocationId);
                 const string error = "MetaSkill execution completed, but its session or result could not be persisted; do not retry automatically.";
-                var persisted = await TryMarkUncertainAsync(callerId, idempotencyKey, error, record.InvocationId);
+                var persisted = await TryMarkUncertainAsync(
+                    callerId,
+                    idempotencyKey,
+                    error,
+                    record.InvocationId,
+                    MetaRunEventComposer.DeriveStepsForTerminal(session, request.Skill));
                 var responseError = persisted
                     ? error
                     : $"{error} The uncertain state could not be persisted either.";
@@ -216,7 +281,12 @@ public sealed class MetaInvocationService(
             var error = exception is OperationCanceledException
                 ? "MetaSkill execution was cancelled; this invocation will not be retried automatically."
                 : $"MetaSkill execution failed ({exception.GetType().Name}); this invocation will not be retried automatically.";
-            if (!await TryMarkUncertainAsync(callerId, idempotencyKey, error, record.InvocationId))
+            if (!await TryMarkUncertainAsync(
+                    callerId,
+                    idempotencyKey,
+                    error,
+                    record.InvocationId,
+                    MetaRunEventComposer.DeriveStepsForTerminal(session, request.Skill)))
                 error = $"{error} The uncertain state could not be persisted.";
             return new MetaInvocationExecutionResult(
                 StatusCodes.Status409Conflict,
@@ -320,11 +390,13 @@ public sealed class MetaInvocationService(
         string callerId,
         string idempotencyKey,
         string error,
-        Guid invocationId)
+        Guid invocationId,
+        IReadOnlyList<MetaRunEventDraft>? stepEvents = null)
     {
         try
         {
-            await store.MarkUncertainAsync(callerId, idempotencyKey, error, CancellationToken.None);
+            await store.MarkUncertainAsync(
+                callerId, idempotencyKey, error, CancellationToken.None, stepEvents);
             return true;
         }
         catch (Exception exception)

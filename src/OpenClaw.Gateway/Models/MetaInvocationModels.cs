@@ -27,6 +27,15 @@ public sealed record MetaInvocationPauseInfo(
     string? Prompt,
     string? ApprovalId);
 
+/// <summary>
+/// One ledger row. <see cref="SessionId"/> and <see cref="Skill"/> were added with B3: the run index
+/// filters by session, and the event journal needs them to reconstruct a timeline for invocations
+/// that predate the journal. Older records deserialize with both null.
+/// </summary>
+/// <param name="EventsGap">
+/// Set when the journal could not be written for this run. The ledger still advanced — the run
+/// happened — so the honest state is "the timeline may be missing events", not a rolled-back run.
+/// </param>
 public sealed record MetaInvocationRecord(
     string CallerId,
     string IdempotencyKey,
@@ -36,7 +45,10 @@ public sealed record MetaInvocationRecord(
     string? Result,
     string? Error,
     DateTimeOffset CreatedAtUtc,
-    MetaInvocationPauseInfo? Pause = null);
+    MetaInvocationPauseInfo? Pause = null,
+    string? SessionId = null,
+    string? Skill = null,
+    bool EventsGap = false);
 
 public enum MetaInvocationClaimKind
 {

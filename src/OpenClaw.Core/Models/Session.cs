@@ -1775,6 +1775,13 @@ public sealed class SessionDelegationChildSummary
 [JsonSerializable(typeof(List<ToolDescriptor>))]
 [JsonSerializable(typeof(SkillArtifact))]
 [JsonSerializable(typeof(SkillStageGateEvent))]
+[JsonSerializable(typeof(MetaRunEvent))]
+[JsonSerializable(typeof(List<MetaRunEvent>))]
+[JsonSerializable(typeof(MetaRunEventPage))]
+[JsonSerializable(typeof(MetaRunEventStreamTerminal))]
+[JsonSerializable(typeof(MetaInvocationSummary))]
+[JsonSerializable(typeof(List<MetaInvocationSummary>))]
+[JsonSerializable(typeof(MetaInvocationListResponse))]
 [JsonSourceGenerationOptions(
     PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase,
     DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,

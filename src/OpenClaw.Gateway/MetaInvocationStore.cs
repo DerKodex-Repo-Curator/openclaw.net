@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Collections.Concurrent;
+using OpenClaw.Core.Models;
 using OpenClaw.Gateway.Models;
 
 namespace OpenClaw.Gateway;
@@ -9,6 +10,7 @@ public sealed class MetaInvocationStore : IHostedService, IDisposable
     private readonly string _path;
     private readonly string _lockPath;
     private readonly int _retentionDays;
+    private readonly MetaRunEventLog _events;
     private readonly ConcurrentDictionary<Guid, FileStream> _activeLeases = new();
 
     public MetaInvocationStore(string storagePath, int retentionDays)
@@ -20,7 +22,11 @@ public sealed class MetaInvocationStore : IHostedService, IDisposable
         _path = Path.GetFullPath(Path.Combine(storagePath, "meta-invocations.json"));
         _lockPath = _path + ".lock";
         _retentionDays = retentionDays;
+        _events = new MetaRunEventLog(Path.GetDirectoryName(_path)!);
     }
+
+    /// <summary>The run journal, exposed so read endpoints do not have to re-derive its paths.</summary>
+    public MetaRunEventLog Events => _events;
 
     public async Task StartAsync(CancellationToken cancellationToken)
         => await MarkInterruptedInvocationsUncertainAsync(cancellationToken);
@@ -35,7 +41,9 @@ public sealed class MetaInvocationStore : IHostedService, IDisposable
         string callerId,
         string idempotencyKey,
         string requestHash,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string? sessionId = null,
+        string? skill = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(callerId);
         ArgumentException.ThrowIfNullOrWhiteSpace(idempotencyKey);
@@ -44,8 +52,18 @@ public sealed class MetaInvocationStore : IHostedService, IDisposable
         using var handle = await AcquireLockAsync(cancellationToken);
         var records = await LoadAsync(cancellationToken);
         var cutoff = DateTimeOffset.UtcNow.AddDays(-_retentionDays);
-        var removed = records.RemoveAll(record =>
-            record.Status != MetaInvocationStatus.Running && record.CreatedAtUtc <= cutoff) > 0;
+        var expired = records.Where(candidate =>
+            candidate.Status != MetaInvocationStatus.Running && candidate.CreatedAtUtc <= cutoff).ToList();
+        var removed = expired.Count > 0;
+        if (removed)
+        {
+            records.RemoveAll(candidate =>
+                candidate.Status != MetaInvocationStatus.Running && candidate.CreatedAtUtc <= cutoff);
+            // The journal lives and dies with its ledger row (T-B3-9): an orphaned .events.ndjson
+            // would be invisible to every endpoint and grow without a bound.
+            foreach (var expiredRecord in expired)
+                _events.Delete(expiredRecord.InvocationId);
+        }
 
         var existingIndex = records.FindIndex(record =>
             string.Equals(record.CallerId, callerId, StringComparison.Ordinal) &&
@@ -70,7 +88,10 @@ public sealed class MetaInvocationStore : IHostedService, IDisposable
             MetaInvocationStatus.Running,
             Result: null,
             Error: null,
-            DateTimeOffset.UtcNow);
+            DateTimeOffset.UtcNow,
+            Pause: null,
+            SessionId: sessionId,
+            Skill: skill);
         var lease = TryAcquireInvocationLease(record.InvocationId)
             ?? throw new IOException("Unable to acquire the meta invocation lease.");
         if (!_activeLeases.TryAdd(record.InvocationId, lease))
@@ -81,6 +102,10 @@ public sealed class MetaInvocationStore : IHostedService, IDisposable
 
         try
         {
+            record = await AppendEventsAsync(
+                record,
+                [new MetaRunEventDraft(MetaRunEventKinds.Claim, Status: nameof(MetaInvocationStatus.Running))],
+                cancellationToken);
             records.Add(record);
             await SaveAsync(records, cancellationToken);
         }
@@ -97,7 +122,8 @@ public sealed class MetaInvocationStore : IHostedService, IDisposable
         string callerId,
         string idempotencyKey,
         string result,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        IReadOnlyList<MetaRunEventDraft>? stepEvents = null)
     {
         ArgumentNullException.ThrowIfNull(result);
 
@@ -113,13 +139,19 @@ public sealed class MetaInvocationStore : IHostedService, IDisposable
         if (current.Status is not (MetaInvocationStatus.Running or MetaInvocationStatus.AwaitingInput))
             throw new InvalidOperationException("Only a running or paused meta invocation can be completed.");
 
-        records[index] = current with
+        var updated = current with
         {
             Status = MetaInvocationStatus.Completed,
             Result = result,
             Error = null,
             Pause = null
         };
+        updated = await AppendEventsAsync(
+            updated,
+            WithTerminalEvent(stepEvents, MetaRunEventKinds.Completed, current, MetaInvocationStatus.Completed),
+            cancellationToken);
+
+        records[index] = updated;
         await SaveAsync(records, cancellationToken);
         ReleaseInvocationLease(current.InvocationId);
     }
@@ -132,7 +164,8 @@ public sealed class MetaInvocationStore : IHostedService, IDisposable
         string callerId,
         string idempotencyKey,
         string errorCode,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        IReadOnlyList<MetaRunEventDraft>? stepEvents = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(errorCode);
 
@@ -148,13 +181,21 @@ public sealed class MetaInvocationStore : IHostedService, IDisposable
         if (current.Status is not (MetaInvocationStatus.Running or MetaInvocationStatus.AwaitingInput))
             throw new InvalidOperationException("Only a running or paused meta invocation can be completed.");
 
-        records[index] = current with
+        var updated = current with
         {
             Status = MetaInvocationStatus.Completed,
             Result = null,
             Error = errorCode,
             Pause = null
         };
+        // A denied approval is a business failure, not an "uncertain" run: the knot of the two is
+        // why the journal has separate `failed` and `uncertain` kinds over the same ledger status.
+        updated = await AppendEventsAsync(
+            updated,
+            WithTerminalEvent(stepEvents, MetaRunEventKinds.Failed, current, MetaInvocationStatus.Completed, errorCode),
+            cancellationToken);
+
+        records[index] = updated;
         await SaveAsync(records, cancellationToken);
         ReleaseInvocationLease(current.InvocationId);
     }
@@ -167,7 +208,8 @@ public sealed class MetaInvocationStore : IHostedService, IDisposable
         string callerId,
         string idempotencyKey,
         MetaInvocationPauseInfo pause,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        IReadOnlyList<MetaRunEventDraft>? stepEvents = null)
     {
         ArgumentNullException.ThrowIfNull(pause);
         ArgumentException.ThrowIfNullOrWhiteSpace(pause.StepId);
@@ -192,6 +234,10 @@ public sealed class MetaInvocationStore : IHostedService, IDisposable
         };
         if (updated != current)
         {
+            updated = await AppendEventsAsync(
+                updated,
+                WithPauseEvents(stepEvents, pause),
+                cancellationToken);
             records[index] = updated;
             await SaveAsync(records, cancellationToken);
         }
@@ -206,7 +252,8 @@ public sealed class MetaInvocationStore : IHostedService, IDisposable
         string callerId,
         string idempotencyKey,
         string error,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        IReadOnlyList<MetaRunEventDraft>? stepEvents = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(error);
 
@@ -222,12 +269,18 @@ public sealed class MetaInvocationStore : IHostedService, IDisposable
         if (current.Status is not (MetaInvocationStatus.Running or MetaInvocationStatus.AwaitingInput))
             throw new InvalidOperationException("Only a running or paused meta invocation can be marked uncertain.");
 
-        records[index] = current with
+        var updated = current with
         {
             Status = MetaInvocationStatus.Uncertain,
             Error = error,
             Pause = null
         };
+        updated = await AppendEventsAsync(
+            updated,
+            WithTerminalEvent(stepEvents, MetaRunEventKinds.Uncertain, current, MetaInvocationStatus.Uncertain, error),
+            cancellationToken);
+
+        records[index] = updated;
         await SaveAsync(records, cancellationToken);
         ReleaseInvocationLease(current.InvocationId);
     }
@@ -276,6 +329,197 @@ public sealed class MetaInvocationStore : IHostedService, IDisposable
         return index < 0 ? null : records[index];
     }
 
+    /// <summary>
+    /// Reads one record by its invocation id, which is what the read endpoints and the dashboard
+    /// have in hand (they never see the caller/idempotency pair).
+    /// </summary>
+    public async Task<MetaInvocationRecord?> TryGetByInvocationIdAsync(
+        Guid invocationId,
+        CancellationToken cancellationToken)
+    {
+        await using var handle = await AcquireLockAsync(cancellationToken);
+        var records = await LoadAsync(cancellationToken);
+        var index = FindIndexByInvocationId(records, invocationId);
+        return index < 0 ? null : records[index];
+    }
+
+    /// <summary>
+    /// Appends events for an invocation the caller already knows about (a resume request, an
+    /// approval decision). Takes the ledger lock so the journal stays ordered with state changes.
+    /// </summary>
+    public async Task AppendEventAsync(
+        Guid invocationId,
+        IReadOnlyList<MetaRunEventDraft> drafts,
+        CancellationToken cancellationToken)
+    {
+        if (drafts.Count == 0)
+            return;
+
+        using var handle = await AcquireLockAsync(cancellationToken);
+        var records = await LoadAsync(cancellationToken);
+        var index = FindIndexByInvocationId(records, invocationId);
+        if (index < 0)
+            return;
+
+        var updated = await AppendEventsAsync(records[index], drafts, cancellationToken);
+        if (updated != records[index])
+        {
+            records[index] = updated;
+            await SaveAsync(records, cancellationToken);
+        }
+    }
+
+    /// <summary>
+    /// Keyset page over the ledger, newest first, ordered by (CreatedAtUtc, InvocationId) so a page
+    /// boundary is stable even when two rows share a timestamp.
+    /// </summary>
+    public async Task<(IReadOnlyList<MetaInvocationRecord> Items, bool HasMore)> ListAsync(
+        string? callerId,
+        string? sessionId,
+        MetaInvocationStatus? status,
+        int limit,
+        DateTimeOffset? cursorCreatedAtUtc,
+        Guid? cursorInvocationId,
+        CancellationToken cancellationToken)
+    {
+        if (limit < 1)
+            throw new ArgumentOutOfRangeException(nameof(limit), "Limit must be at least one.");
+
+        await using var handle = await AcquireLockAsync(cancellationToken);
+        var records = await LoadAsync(cancellationToken);
+
+        // One extra row tells the caller whether a next page exists without a second count query.
+        var items = records
+            .Where(record => callerId is null || string.Equals(record.CallerId, callerId, StringComparison.Ordinal))
+            .Where(record => string.IsNullOrWhiteSpace(sessionId) ||
+                string.Equals(record.SessionId, sessionId, StringComparison.Ordinal))
+            .Where(record => status is null || record.Status == status)
+            .Where(record => cursorCreatedAtUtc is null || IsBeforeCursor(record, cursorCreatedAtUtc.Value, cursorInvocationId))
+            .OrderByDescending(record => record.CreatedAtUtc)
+            .ThenByDescending(record => record.InvocationId)
+            .Take(limit + 1)
+            .ToList();
+
+        var hasMore = items.Count > limit;
+        if (hasMore)
+            items.RemoveAt(items.Count - 1);
+
+        return (items, hasMore);
+    }
+
+    private static bool IsBeforeCursor(
+        MetaInvocationRecord record,
+        DateTimeOffset cursorCreatedAtUtc,
+        Guid? cursorInvocationId)
+    {
+        if (record.CreatedAtUtc < cursorCreatedAtUtc)
+            return true;
+        if (record.CreatedAtUtc > cursorCreatedAtUtc)
+            return false;
+
+        // Same instant: fall back to the id so the page cannot loop or skip a row.
+        return cursorInvocationId is null || record.InvocationId.CompareTo(cursorInvocationId.Value) < 0;
+    }
+
+    private static int FindIndexByInvocationId(List<MetaInvocationRecord> records, Guid invocationId)
+        => records.FindIndex(record => record.InvocationId == invocationId);
+
+    /// <summary>
+    /// Appends the given drafts and reports the resulting record. A journal write failure never
+    /// fails the state transition: the run is real, so the honest outcome is EventsGap=true on an
+    /// advanced ledger, not a rolled-back run that the caller would retry into a duplicate.
+    /// </summary>
+    private async Task<MetaInvocationRecord> AppendEventsAsync(
+        MetaInvocationRecord record,
+        IReadOnlyList<MetaRunEventDraft> drafts,
+        CancellationToken cancellationToken)
+    {
+        if (drafts.Count == 0)
+            return record;
+
+        try
+        {
+            var kept = DedupeSynthetic(record.InvocationId, drafts);
+            if (kept.Count > 0)
+                await _events.AppendAsync(record.InvocationId, kept, DateTimeOffset.UtcNow, cancellationToken);
+            return record;
+        }
+        catch (Exception exception) when (exception is IOException
+            or UnauthorizedAccessException
+            or JsonException
+            or NotSupportedException)
+        {
+            return record with { EventsGap = true };
+        }
+    }
+
+    /// <summary>
+    /// Drops synthetic events whose (kind, step) pair is already in the journal. Derived step
+    /// events describe a state snapshot, so re-deriving the same step on a later observation must
+    /// not append it twice; real events (pause, resume, terminal) are never deduped because the
+    /// same step legitimately pauses more than once.
+    /// </summary>
+    private List<MetaRunEventDraft> DedupeSynthetic(Guid invocationId, IReadOnlyList<MetaRunEventDraft> drafts)
+    {
+        if (!drafts.Any(static draft => draft.Synthetic))
+            return [.. drafts];
+
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var existing in _events.Read(invocationId).Events)
+        {
+            if (existing.Synthetic)
+                seen.Add(existing.Kind + "|" + existing.StepId);
+        }
+
+        var kept = new List<MetaRunEventDraft>(drafts.Count);
+        foreach (var draft in drafts)
+        {
+            if (draft.Synthetic && !seen.Add(draft.Kind + "|" + draft.StepId))
+                continue;
+            kept.Add(draft);
+        }
+
+        return kept;
+    }
+
+    private static List<MetaRunEventDraft> WithTerminalEvent(
+        IReadOnlyList<MetaRunEventDraft>? stepEvents,
+        string kind,
+        MetaInvocationRecord current,
+        MetaInvocationStatus status,
+        string? detail = null)
+    {
+        var drafts = new List<MetaRunEventDraft>(stepEvents ?? []);
+        drafts.Add(new MetaRunEventDraft(kind, current.Pause?.StepId, status.ToString(), detail));
+        return drafts;
+    }
+
+    private static List<MetaRunEventDraft> WithPauseEvents(
+        IReadOnlyList<MetaRunEventDraft>? stepEvents,
+        MetaInvocationPauseInfo pause)
+    {
+        var drafts = new List<MetaRunEventDraft>(stepEvents ?? []);
+        drafts.Add(new MetaRunEventDraft(
+            MetaRunEventKinds.StepPaused,
+            pause.StepId,
+            nameof(MetaInvocationStatus.AwaitingInput),
+            pause.Reason));
+
+        if (!string.IsNullOrWhiteSpace(pause.ApprovalId))
+        {
+            // The approval id itself is a machine handle; the journal carries only a stable short
+            // form so a timeline never leaks a usable token.
+            var shortId = pause.ApprovalId.Length <= 16 ? pause.ApprovalId : pause.ApprovalId[..16];
+            drafts.Add(new MetaRunEventDraft(
+                MetaRunEventKinds.ApprovalRequested,
+                pause.StepId,
+                nameof(MetaInvocationStatus.AwaitingInput),
+                shortId));
+        }
+
+        return drafts;
+    }
+
     public async Task MarkInterruptedInvocationsUncertainAsync(CancellationToken cancellationToken)
     {
         using var handle = await AcquireLockAsync(cancellationToken);
@@ -293,11 +537,23 @@ public sealed class MetaInvocationStore : IHostedService, IDisposable
 
             using (lease)
             {
-                records[index] = record with
+                var interrupted = record with
                 {
                     Status = MetaInvocationStatus.Uncertain,
                     Error = "Invocation was interrupted before a terminal result was persisted."
                 };
+                // The sweep is the only writer that turns a run terminal without an executing
+                // worker, so it must leave a `uncertain` event behind or the timeline would end
+                // mid-run with no explanation.
+                interrupted = await AppendEventsAsync(
+                    interrupted,
+                    [new MetaRunEventDraft(
+                        MetaRunEventKinds.Uncertain,
+                        record.Pause?.StepId,
+                        nameof(MetaInvocationStatus.Uncertain),
+                        interrupted.Error)],
+                    cancellationToken);
+                records[index] = interrupted;
                 changed = true;
             }
         }

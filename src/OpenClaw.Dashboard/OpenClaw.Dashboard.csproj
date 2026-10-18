@@ -8,6 +8,9 @@
   <ItemGroup>
     <Compile Include="../OpenClaw.Core/Models/SessionRecoveryExplanation.cs" Link="Models/SessionRecoveryExplanation.cs" />
     <Compile Include="../OpenClaw.Core/Models/AuthSessionRequest.cs" Link="Models/AuthSessionRequest.cs" />
+    <!-- B3: the SSE frame parser is a pure function with no Blazor dependency, so the run page
+         links it instead of growing a second, subtly different parser in the browser. -->
+    <Compile Include="../OpenClaw.Core/Streaming/SseFrameParser.cs" Link="Streaming/SseFrameParser.cs" />
     <PackageReference Include="Microsoft.AspNetCore.Components.WebAssembly" />
     <PackageReference Include="Microsoft.AspNetCore.Components.WebAssembly.DevServer" PrivateAssets="all" />
     <PackageReference Include="Microsoft.AspNetCore.SignalR.Client" />
