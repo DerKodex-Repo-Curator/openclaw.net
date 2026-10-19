@@ -47,6 +47,13 @@ public sealed class AgentRuntime : IAgentRuntime
     private string _systemPrompt = string.Empty;
     private readonly int _maxTokens;
     private readonly int _maxIterations;
+
+    /// <summary>
+    /// When true, the last permitted model call is made without tools and is reserved for a usable
+    /// final answer. Set only for delegated sub-agents, where "ran out of iterations" currently
+    /// yields either a bare limit notice or a summary that silently omits unfinished work.
+    /// </summary>
+    private readonly bool _reserveFinalIterationForAnswer;
     private readonly float _temperature;
     private readonly int _maxHistoryTurns;
     private readonly bool _parallelToolExecution;
@@ -131,13 +138,17 @@ public sealed class AgentRuntime : IAgentRuntime
         CapabilitySlotExecutor? capabilitySlotExecutor = null,
         IMetaApprovalStore? metaApprovals = null,
         SkillIndexCompiler? skillIndexCompiler = null,
-        McpServerHealthStore? mcpHealthStore = null)
+        McpServerHealthStore? mcpHealthStore = null,
+        bool reserveFinalIterationForAnswer = false)
     {
         _logger = logger;
         _capabilitySlotExecutor = capabilitySlotExecutor;
         _config = config;
         _maxTokens = config.MaxTokens;
         _maxIterations = Math.Max(1, maxIterations);
+        // Reserving the only allowed call would leave the sub-agent unable to use a tool at all, so
+        // the behaviour is only meaningful from two iterations up.
+        _reserveFinalIterationForAnswer = reserveFinalIterationForAnswer && _maxIterations >= 2;
         _temperature = config.Temperature;
         _maxHistoryTurns = Math.Max(1, maxHistoryTurns);
         _parallelToolExecution = parallelToolExecution;
@@ -457,6 +468,20 @@ public sealed class AgentRuntime : IAgentRuntime
 
             LlmExecutionResult? executionResult = null;
             var llmSw = Stopwatch.StartNew();
+
+            // ── Reserved final-answer call ──
+            // The last permitted call is spent on an answer instead of another tool round-trip.
+            // Without this the loop exits on the limit and the caller gets either a bare "maximum
+            // iterations reached" notice or nothing at all, which reads like a finished task.
+            var isReservedFinalCall = _reserveFinalIterationForAnswer && i == _maxIterations - 1;
+            var toolsBeforeReservedCall = chatOptions.Tools;
+            if (isReservedFinalCall)
+            {
+                messages.Add(new ChatMessage(ChatRole.System, DelegationCompleteness.FinalCallInstruction));
+                chatOptions.Tools = null;
+            }
+            // ── End reserved final-answer call ──
+
             try
             {
                 executionResult = await CallLlmWithResilienceAsync(session, messages, chatOptions, turnCtx, ct);
@@ -506,6 +531,11 @@ public sealed class AgentRuntime : IAgentRuntime
                 LogTurnComplete(turnCtx);
                 return AgentTurnResult.Completed("Sorry, I'm having trouble reaching my AI provider right now. Please try again shortly.");
             }
+            finally
+            {
+                if (isReservedFinalCall)
+                    chatOptions.Tools = toolsBeforeReservedCall;
+            }
             llmSw.Stop();
 
             if (executionResult is null)
@@ -552,6 +582,29 @@ public sealed class AgentRuntime : IAgentRuntime
                 AppendContractSnapshot(session, "budget_exceeded");
                 LogTurnComplete(turnCtx);
                 return AgentTurnResult.Completed(contractBudgetMessage);
+            }
+
+            // The reserved call had no tools, so whatever it produced is the answer. Any tool call in
+            // the response is the model ignoring the instruction and is deliberately dropped rather
+            // than executed: spending the last call and then starting another tool round-trip would
+            // put the caller back in the same "no answer, no signal" position.
+            if (isReservedFinalCall)
+            {
+                var finalText = _redaction.Redact(response.Text ?? string.Empty);
+                if (!string.IsNullOrWhiteSpace(finalText))
+                {
+                    var marked = DelegationCompleteness.AppendNotice(finalText, _maxIterations);
+                    session.History.Add(new ChatTurn { Role = "assistant", Content = marked });
+                    AgentCheckpointManager.MarkCheckpointCompleted(
+                        session, SessionCheckpointStates.Completed, "final_response");
+                    AppendContractSnapshot(session, "active");
+                    LogTurnComplete(turnCtx);
+                    return AgentTurnResult.Completed(marked);
+                }
+
+                // No usable text: fall through to the existing batch-limit result so the caller
+                // still learns the run stopped instead of receiving an empty answer.
+                break;
             }
 
             // Check for tool calls

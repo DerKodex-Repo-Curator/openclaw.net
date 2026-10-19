@@ -111,6 +111,56 @@ public sealed class CodeExecTool : ITool, ISandboxCapableTool
         return sb.ToString();
     }
 
+    /// <summary>
+    /// True when generated code runs with the gateway's own privileges and network reach, i.e. the
+    /// backend is not an isolating sandbox.
+    /// </summary>
+    /// <remarks>
+    /// The <c>process</c> backend starts an interpreter as a child of the gateway: same user, same
+    /// environment, same loopback network. Code that runs there can reach the gateway's own HTTP/MCP
+    /// surface, so an approval-required tool is one <c>curl</c> away from being called without its
+    /// prompt. That is a property of running arbitrary code, not a defect to be patched inside this
+    /// tool — but it must be visible, because "code_exec is approval-gated" is not the same guarantee
+    /// as "no approval-gated tool can be reached from generated code".
+    /// </remarks>
+    public static bool RunsWithGatewayPrivileges(CodeExecConfig config)
+    {
+        ArgumentNullException.ThrowIfNull(config);
+        return config.Enabled && !string.Equals(config.Backend, "docker", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Docker arguments for one snippet. Extracted so the isolation flags below are pinned by a test
+    /// rather than by review: <c>--network none</c> is what makes the audit conclusion hold.
+    /// </summary>
+    internal static List<string> BuildDockerArguments(
+        CodeExecConfig config,
+        string codeFile,
+        string ext,
+        string interpreter,
+        string flags)
+    {
+        var dockerArgs = new List<string>
+        {
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--memory=256m",
+            "--cpus=1",
+            "-v",
+            $"{codeFile}:/code{ext}:ro",
+            "-w",
+            "/tmp",
+            config.DockerImage,
+            interpreter
+        };
+
+        AddArgumentTokens(dockerArgs, flags);
+        dockerArgs.Add($"/code{ext}");
+        return dockerArgs;
+    }
+
     private async Task<string> RunInDockerAsync(string language, string code, int timeoutSec, CancellationToken ct)
     {
         var (interpreter, flags) = GetInterpreter(language);
@@ -125,24 +175,7 @@ public sealed class CodeExecTool : ITool, ISandboxCapableTool
 
         try
         {
-            var dockerArgs = new List<string>
-            {
-                "run",
-                "--rm",
-                "--network",
-                "none",
-                "--memory=256m",
-                "--cpus=1",
-                "-v",
-                $"{codeFile}:/code{ext}:ro",
-                "-w",
-                "/tmp",
-                _config.DockerImage,
-                interpreter
-            };
-
-            AddArgumentTokens(dockerArgs, flags);
-            dockerArgs.Add($"/code{ext}");
+            var dockerArgs = BuildDockerArguments(_config, codeFile, ext, interpreter, flags);
 
             return await RunProcessAsync("docker", dockerArgs, timeoutSec, ct);
         }

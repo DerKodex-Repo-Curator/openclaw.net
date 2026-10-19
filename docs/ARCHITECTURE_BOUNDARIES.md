@@ -165,6 +165,20 @@ flowchart LR
     Packs --> Products["Downstream Products"]
 ```
 
+## Enforcement
+
+The rules above are prose, so a subset of them is also enforced by `src/OpenClaw.Tests/ArchitectureBoundaryTests.cs`. Those tests read `.csproj` files directly instead of loading assemblies: they run in milliseconds, need no project references of their own, and fail on the exact reference that broke the rule. Keeping them in the ordinary test project is deliberate — a guard against dependency creep should not add a dependency edge to the graph it guards.
+
+| Test | Rule it keeps honest |
+| --- | --- |
+| `Core_ReferencesNoOtherProductProject` | Core stays leaf-level: no product project may be referenced from it. |
+| `Core_ReferencesNoVendorSdkPackages` | Vendor SDKs (Nacos, MCP transports, cloud clients) live in adapters, never in Core. |
+| `Core_ReferencesNoAspNetCorePackages` | Core is host-agnostic; only Gateway and above may take a web stack dependency. |
+| `Agent_DoesNotReferenceGateway` | The runtime never calls back into the gateway that hosts it. |
+| `OnlyTestProjectsReferenceGateway` | Nothing ships a production dependency on Gateway; it is a composition root, not a library. |
+
+When a new boundary matters enough to argue about in review, add the corresponding `ProjectReference` or `PackageReference` assertion there in the same pull request. A rule that only exists in this document is a preference; a rule with a test is a boundary.
+
 ## Review Rule
 
 When a change is hard to place, reviewers should ask:

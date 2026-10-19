@@ -73,7 +73,10 @@ public sealed class MafAgentRuntimeFactory : IAgentRuntimeFactory
             RecordContractTurnUsage = context.RecordContractTurnUsage,
             AppendContractSnapshot = context.AppendContractSnapshot,
             CapabilitySlotExecutor = context.CapabilitySlotExecutor,
-            Interceptors = context.Interceptors
+            Interceptors = context.Interceptors,
+            // Delegated sub-agent: its last permitted model call produces an answer, not another
+            // tool round-trip (parity with the native lane).
+            ReserveFinalIterationForAnswer = true
         });
 
     private static GatewayConfig CreateDelegatedConfig(

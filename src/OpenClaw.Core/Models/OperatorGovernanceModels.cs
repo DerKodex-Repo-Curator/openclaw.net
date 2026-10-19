@@ -193,6 +193,13 @@ public static class ToolFailureCodes
     public const string ToolFailed = "tool_failed";
 
     /// <summary>
+    /// The turn's tool-call budget is spent. Distinct from <see cref="ToolFailed"/> because nothing
+    /// is broken: the right recovery is to answer from the results already gathered, or for an
+    /// operator to raise the contract's <c>MaxToolCalls</c>.
+    /// </summary>
+    public const string ToolCallBudgetExhausted = "tool_call_budget_exhausted";
+
+    /// <summary>
     /// The MCP server that owns this tool is <c>down</c>, so the call was refused before it reached
     /// the wire. Distinct from <see cref="ToolFailed"/>: nothing was attempted, and retrying against
     /// a healthy server may well succeed (design §8.1).

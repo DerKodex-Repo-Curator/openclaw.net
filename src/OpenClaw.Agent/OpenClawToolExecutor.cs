@@ -510,7 +510,10 @@ public sealed class OpenClawToolExecutor
                     : await hook.BeforeExecuteAsync(tool.Name, persistedArgsJson, ct);
                 if (!allowed)
                 {
-                    var deniedByHook = $"Tool execution denied by hook: {hook.Name}";
+                    // A hook that can explain itself turns "denied by hook" into something the model
+                    // can act on: the refuse-in-place path is only recoverable if the reason is legible.
+                    var denial = hook is IToolHookDenialReason explainer ? explainer.ExplainDenial(hookCtx) : null;
+                    var deniedByHook = denial?.Message ?? $"Tool execution denied by hook: {hook.Name}";
                     _logger?.LogInformation("[{CorrelationId}] {Message}", turnCtx.CorrelationId, deniedByHook);
                     return CreateImmediateResult(
                         toolName,
@@ -518,8 +521,9 @@ public sealed class OpenClawToolExecutor
                         deniedByHook,
                         callId: callId,
                         resultStatus: ToolResultStatuses.Blocked,
-                        failureCode: ToolFailureCodes.ToolFailed,
+                        failureCode: denial?.FailureCode ?? ToolFailureCodes.ToolFailed,
                         failureMessage: deniedByHook,
+                        nextStep: denial?.NextStep,
                         governanceDecision: governanceDecision);
                 }
             }

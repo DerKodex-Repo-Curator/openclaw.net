@@ -81,7 +81,11 @@ public sealed class DelegateTool : IToolWithContext
             logger: _logger,
             metrics: _metrics,
             maxIterations: profile.MaxIterations,
-            recall: _recall));
+            recall: _recall,
+            // The sub-agent's last model call is spent producing an answer, not on another tool
+            // round-trip, so hitting the iteration limit degrades into a partial answer with its
+            // gaps stated instead of a bare limit notice.
+            reserveFinalIterationForAnswer: true));
     }
 
     public ValueTask<string> ExecuteAsync(string argumentsJson, CancellationToken ct)
@@ -185,7 +189,13 @@ public sealed class DelegateTool : IToolWithContext
                 fullTask,
                 ct,
                 callerCredentialContext: context?.McpCallerCredentialContext);
-            FinalizeDelegation(subSession, parentSummary, status: "completed", result, error: null);
+            FinalizeDelegation(
+                subSession,
+                parentSummary,
+                status: "completed",
+                result,
+                error: null,
+                incomplete: DelegationCompleteness.HasNotice(result));
             await _memory.SaveSessionAsync(subSession, ct);
             _logger?.LogInformation("Sub-agent '{Profile}' completed (depth {Depth}), response length={Length}",
                 profileName, _currentDepth + 1, result.Length);
@@ -229,7 +239,8 @@ public sealed class DelegateTool : IToolWithContext
         SessionDelegationChildSummary? parentSummary,
         string status,
         string? result,
-        string? error)
+        string? error,
+        bool incomplete = false)
     {
         var toolUsage = BuildToolUsage(subSession);
         var proposedChanges = toolUsage
@@ -241,7 +252,12 @@ public sealed class DelegateTool : IToolWithContext
                 Summary = item.Summary
             })
             .ToArray();
-        var preview = Truncate(error ?? result ?? string.Empty, 240);
+        // The marker sits at the end of a long result, so the card's short preview would hide it.
+        // Lead with it instead: "completed" and "completed, but only half the task" are not the
+        // same thing to an operator scanning delegations.
+        var preview = incomplete
+            ? DelegationCompleteness.MarkerPrefix + " partial] " + Truncate(error ?? result ?? string.Empty, 240)
+            : Truncate(error ?? result ?? string.Empty, 240);
         var completedAtUtc = DateTimeOffset.UtcNow;
 
         if (subSession.Delegation is not null)
@@ -251,6 +267,7 @@ public sealed class DelegateTool : IToolWithContext
             subSession.Delegation.FinalResponsePreview = preview;
             subSession.Delegation.ToolUsage = toolUsage;
             subSession.Delegation.ProposedChanges = proposedChanges;
+            subSession.Delegation.ResultIncomplete = incomplete;
         }
 
         if (parentSummary is not null)
@@ -260,6 +277,7 @@ public sealed class DelegateTool : IToolWithContext
             parentSummary.FinalResponsePreview = preview;
             parentSummary.ToolUsage = toolUsage;
             parentSummary.ProposedChanges = proposedChanges;
+            parentSummary.ResultIncomplete = incomplete;
         }
     }
 

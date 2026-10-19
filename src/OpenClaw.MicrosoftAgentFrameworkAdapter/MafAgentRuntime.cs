@@ -54,6 +54,13 @@ public sealed class MafAgentRuntime : IAgentRuntime
     private readonly int _compactionKeepRecent;
     private readonly long _sessionTokenBudget;
     private readonly int _maxIterations;
+
+    /// <summary>
+    /// When true, the last permitted model call is made without tools and is reserved for a usable
+    /// final answer. Set only for delegated sub-agents; mirrors <c>AgentRuntime</c> so both
+    /// orchestrators degrade the same way at the iteration limit.
+    /// </summary>
+    private readonly bool _reserveFinalIterationForAnswer;
     private readonly IGoalService? _goalService;
     private readonly AgentRuntimeGoalIntegration? _goalIntegration;
     private readonly MemoryRecallConfig? _recall;
@@ -124,6 +131,9 @@ public sealed class MafAgentRuntime : IAgentRuntime
         _compactionKeepRecent = Math.Max(2, context.Config.Memory.CompactionKeepRecent);
         _sessionTokenBudget = context.Config.SessionTokenBudget;
         _maxIterations = 50; // Matches Goal design doc's max iterations guard
+        // Parity with AgentRuntime: a delegated sub-agent spends its last permitted call on an
+        // answer instead of another tool round-trip.
+        _reserveFinalIterationForAnswer = context.ReserveFinalIterationForAnswer && _maxIterations >= 2;
         _backgroundExecutionEnabled = context.Config.BackgroundExecution.Enabled;
         _recall = context.Config.Memory.Recall;
         _requireToolApproval = context.RequireToolApproval;
@@ -366,6 +376,15 @@ public sealed class MafAgentRuntime : IAgentRuntime
             // Goal-aware iteration loop (mirrors AgentRuntime pattern)
             for (var i = 0; i < _maxIterations; i++)
             {
+                // ── Reserved final-answer call ──
+                // Same contract as AgentRuntime: the last permitted call is spent on an answer, with
+                // tools withheld, so the limit produces a partial answer that states its gaps instead
+                // of a bare "maximum iterations reached".
+                var isReservedFinalCall = _reserveFinalIterationForAnswer && i == _maxIterations - 1;
+                if (isReservedFinalCall)
+                    messages.Add(new ChatMessage(ChatRole.System, DelegationCompleteness.FinalCallInstruction));
+                // ── End reserved final-answer call ──
+
                 using var scope = AgentExecutionContextScope.Push(new AgentExecutionContext
                 {
                     Session = session,
@@ -380,13 +399,39 @@ public sealed class MafAgentRuntime : IAgentRuntime
                     ApprovalCallback = approvalCallback
                 });
 
+                var chatOptions = CreateChatOptions(session, responseSchema);
+                if (isReservedFinalCall)
+                    chatOptions.Tools = []; // An explicit empty list overrides the agent's configured tools.
+
                 var response = await agent.RunAsync(
                     messages,
                     mafSession,
-                    new ChatClientAgentRunOptions(CreateChatOptions(session, responseSchema)),
+                    new ChatClientAgentRunOptions(chatOptions),
                     ct);
 
                 var text = ExtractResponseText(response);
+
+                if (isReservedFinalCall)
+                {
+                    if (string.IsNullOrWhiteSpace(text))
+                        break; // No usable answer: fall through to the iteration-limit result.
+
+                    var marked = DelegationCompleteness.AppendNotice(text, _maxIterations);
+                    session.History.Add(new ChatTurn { Role = "assistant", Content = marked });
+                    DisposeTurnRoutingScope();
+                    await _sessionStateStore.SaveAsync(agent, session, mafSession, ct);
+
+                    if (TryRejectContractBudget(session, out var reservedBudgetMessage))
+                    {
+                        AppendContractSnapshot(session, "budget_exceeded");
+                        LogTurnComplete(turnCtx);
+                        return Agent.AgentTurnResult.Completed(reservedBudgetMessage);
+                    }
+
+                    AppendContractSnapshot(session, "active");
+                    LogTurnComplete(turnCtx);
+                    return Agent.AgentTurnResult.Completed(marked);
+                }
 
                 // Record tool invocations and assistant response
                 if (toolInvocations.Count > 0)

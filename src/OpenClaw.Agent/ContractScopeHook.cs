@@ -10,7 +10,12 @@ namespace OpenClaw.Agent;
 /// Enforces contract-scoped tool restrictions at tool-call time.
 /// Checks path-scoped capabilities and tool call count limits.
 /// </summary>
-public sealed class ContractScopeHook : IToolHookWithContext
+/// <remarks>
+/// Implements <see cref="IToolHookDenialReason"/> so a refusal reaches the model as an actionable
+/// message rather than "denied by hook: ContractScope". The explanation is derived by re-running the
+/// same <see cref="Evaluate"/> the decision used, so the two cannot drift apart.
+/// </remarks>
+public sealed class ContractScopeHook : IToolHookWithContext, IToolHookDenialReason
 {
     private readonly Func<string, ContractPolicy?> _contractResolver;
     private readonly Func<string, int> _toolCallCounter;
@@ -19,7 +24,10 @@ public sealed class ContractScopeHook : IToolHookWithContext
     public string Name => "ContractScope";
 
     /// <param name="contractResolver">Resolves a session ID to its contract policy (or null).</param>
-    /// <param name="toolCallCounter">Returns the current tool call count for a session ID.</param>
+    /// <param name="toolCallCounter">
+    /// Returns the tool calls already made in the session's <em>current turn</em>. Counting across the
+    /// whole session would make a long-lived conversation permanently unable to call tools.
+    /// </param>
     /// <param name="logger">Logger instance.</param>
     public ContractScopeHook(
         Func<string, ContractPolicy?> contractResolver,
@@ -40,20 +48,46 @@ public sealed class ContractScopeHook : IToolHookWithContext
         if (policy is null)
             return ValueTask.FromResult(true);
 
-        // Check MaxToolCalls
+        return ValueTask.FromResult(Evaluate(policy, context, log: true) is null);
+    }
+
+    /// <inheritdoc />
+    public ToolHookDenial? ExplainDenial(ToolHookContext context)
+    {
+        var policy = _contractResolver(context.SessionId);
+        return policy is null ? null : Evaluate(policy, context, log: false);
+    }
+
+    /// <summary>
+    /// Returns <see langword="null"/> when the call is allowed, otherwise the refusal to report.
+    /// </summary>
+    /// <param name="log">
+    /// Whether to emit the operator-facing log line. Explanations re-run this without logging so a
+    /// single denial is not logged twice.
+    /// </param>
+    private ToolHookDenial? Evaluate(ContractPolicy policy, ToolHookContext context, bool log)
+    {
         if (policy.MaxToolCalls > 0)
         {
             var count = _toolCallCounter(context.SessionId);
             if (count >= policy.MaxToolCalls)
             {
-                _logger.LogInformation(
-                    "ContractScope: denied tool {Tool} for session {Session} — MaxToolCalls ({Max}) reached",
-                    context.ToolName, context.SessionId, policy.MaxToolCalls);
-                return ValueTask.FromResult(false);
+                if (log)
+                {
+                    _logger.LogInformation(
+                        "ContractScope: denied tool {Tool} for session {Session} — MaxToolCalls ({Max}) reached",
+                        context.ToolName, context.SessionId, policy.MaxToolCalls);
+                }
+
+                return new ToolHookDenial(
+                    $"Tool call budget exhausted for this turn: this session's contract allows " +
+                    $"{policy.MaxToolCalls} tool calls and {count} have already been made. Do not call " +
+                    $"more tools; answer from the results you already have.",
+                    ToolFailureCodes.ToolCallBudgetExhausted,
+                    "Raise the contract's MaxToolCalls, or narrow the request so it needs fewer tool calls.");
             }
         }
 
-        // Check scoped capabilities (path restrictions)
         var scope = FindScope(policy, context.ToolName);
         var hasScopedFilesystemCapability = HasScopedFilesystemCapability(policy);
         if (scope is null && hasScopedFilesystemCapability && IsFilesystemAffectingTool(context.ToolName))
@@ -63,19 +97,31 @@ public sealed class ContractScopeHook : IToolHookWithContext
             // tools are denied because they lack a matching scope entry.
             if (context.ToolName is "shell" or "code_exec")
             {
-                _logger.LogInformation(
-                    "ContractScope: denied tool {Tool} for session {Session} — shell/exec tools require an explicit grant under scoped filesystem contracts",
-                    context.ToolName,
-                    context.SessionId);
+                if (log)
+                {
+                    _logger.LogInformation(
+                        "ContractScope: denied tool {Tool} for session {Session} — shell/exec tools require an explicit grant under scoped filesystem contracts",
+                        context.ToolName,
+                        context.SessionId);
+                }
+
+                return new ToolHookDenial(
+                    "This session's contract only grants scoped filesystem access, so shell and code " +
+                    "execution tools are unavailable. Use the file tools that were granted, or ask the " +
+                    "operator to grant shell access.");
             }
-            else
+
+            if (log)
             {
                 _logger.LogInformation(
                     "ContractScope: denied tool {Tool} for session {Session} — tool is unscoped under a scoped filesystem contract",
                     context.ToolName,
                     context.SessionId);
             }
-            return ValueTask.FromResult(false);
+
+            return new ToolHookDenial(
+                $"The {context.ToolName} tool is not granted by this session's contract. Only the file " +
+                "tools covered by a scoped capability can be used.");
         }
 
         if (scope is not null && scope.AllowedPaths.Length > 0)
@@ -89,24 +135,38 @@ public sealed class ContractScopeHook : IToolHookWithContext
 
                     if (!IsPathAllowed(path, scope.AllowedPaths))
                     {
-                        _logger.LogInformation(
-                            "ContractScope: denied tool {Tool} path {Path} for session {Session} — outside scoped paths",
-                            context.ToolName, path, context.SessionId);
-                        return ValueTask.FromResult(false);
+                        if (log)
+                        {
+                            _logger.LogInformation(
+                                "ContractScope: denied tool {Tool} path {Path} for session {Session} — outside scoped paths",
+                                context.ToolName, path, context.SessionId);
+                        }
+
+                        return new ToolHookDenial(
+                            $"The path given to {context.ToolName} is outside the folders this session's " +
+                            "contract grants. Retry inside a granted folder, or ask the operator to widen " +
+                            "the contract.");
                     }
                 }
             }
             else if (RequiresResolvedScopedPath(context.ToolName))
             {
-                _logger.LogInformation(
-                    "ContractScope: denied tool {Tool} for session {Session} — scoped path could not be resolved safely",
-                    context.ToolName,
-                    context.SessionId);
-                return ValueTask.FromResult(false);
+                if (log)
+                {
+                    _logger.LogInformation(
+                        "ContractScope: denied tool {Tool} for session {Session} — scoped path could not be resolved safely",
+                        context.ToolName,
+                        context.SessionId);
+                }
+
+                return new ToolHookDenial(
+                    $"The {context.ToolName} call could not be checked against this session's contract " +
+                    "because its target path could not be resolved. Supply an explicit path inside a " +
+                    "granted folder.");
             }
         }
 
-        return ValueTask.FromResult(true);
+        return null;
     }
 
     public ValueTask AfterExecuteAsync(string toolName, string arguments, string result, TimeSpan duration, bool failed, CancellationToken ct)

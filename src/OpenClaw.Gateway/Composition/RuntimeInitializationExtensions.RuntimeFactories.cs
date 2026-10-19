@@ -304,14 +304,7 @@ internal static partial class RuntimeInitializationExtensions
                     var session = sessionManager.TryGetActiveById(sessionId);
                     return session?.ContractPolicy;
                 },
-                sessionId =>
-                {
-                    var session = sessionManager.TryGetActiveById(sessionId);
-                    if (session is null) return 0;
-                    return session.History
-                        .Where(t => t.ToolCalls is { Count: > 0 })
-                        .Sum(t => t.ToolCalls!.Count);
-                },
+                sessionId => SessionToolBudget.CountToolCallsInCurrentTurn(sessionManager.TryGetActiveById(sessionId)),
                 loggerFactory.CreateLogger("ContractScopeHook"))
         };
 

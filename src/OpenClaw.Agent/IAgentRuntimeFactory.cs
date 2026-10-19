@@ -55,6 +55,13 @@ public sealed class AgentRuntimeFactoryContext
     /// tools behave exactly as before.
     /// </summary>
     public McpServerHealthStore? McpHealthStore { get; init; }
+
+    /// <summary>
+    /// True when this runtime is a delegated sub-agent. Its last permitted model call is then spent
+    /// producing an answer instead of another tool round-trip, so hitting the iteration limit
+    /// degrades into a partial answer that names its gaps rather than a bare limit notice.
+    /// </summary>
+    public bool ReserveFinalIterationForAnswer { get; init; }
 }
 
 public interface IAgentRuntimeFactory

@@ -223,6 +223,7 @@ Admin/ops tool to list active sessions, inspect recent history, or send a cross-
 
 ### 7. Delegate Agent Tool (`delegate_agent`)
 Spawns a “sub-agent” for multi-agent delegation (only present when `OpenClaw:Delegation:Enabled=true`).
+- The child's last iteration is reserved for an answer, so a child that hits its iteration limit still returns partial work, marked `[DELEGATION_INCOMPLETE: partial]`. See [Turn Budgets and Partial Answers](#-turn-budgets-and-partial-answers).
 
 ### 7a. Payment Tool (`payment`)
 Gateway-registered first-party payment tool over the native payment runtime. Disabled by default via `OpenClaw:Payments:Enabled=false`.
@@ -277,6 +278,7 @@ Fetch and extract content from URLs (useful for summarization pipelines).
 Execute Python, JavaScript, or Bash code in a isolated environment.
 - **Backends**: `process` (local), `docker` (isolated).
 - **Options**: `DockerImage`, `AllowedLanguages`.
+- **Trust boundary**: only the `docker` backend isolates generated code from the gateway. Under `process`, code inherits the gateway's environment and loopback network, so it can reach the gateway's own HTTP/MCP surface and therefore approval-gated tools *without* an approval prompt. The gateway logs a warning at startup when `code_exec` is registered on a non-Docker backend while `OpenClaw:Tooling:ApprovalRequiredTools` is non-empty. Full analysis: [security/code-exec-approval-boundary.md](security/code-exec-approval-boundary.md).
 
 ### 13. PDF Reader (`pdf_read`)
 Extract text from PDF documents.
@@ -361,6 +363,42 @@ Runtime discovery of all registered tools. Returns every tool's name, descriptio
   - `filter` (optional): substring match against tool names (case-insensitive). Omitting `filter` returns all tools.
 - **Output**: JSON array of objects with `name` (string), `description` (string), and `parameterSchema` (JSON object, the tool's input schema).
 - **Usage**: Called programmatically by MetaSKILL `kind: fan_out` steps to validate tool availability, or directly by the agent when reasoning about which tools to use.
+
+---
+
+## 🧮 Turn Budgets and Partial Answers
+
+Two limits exist and they mean different things. Both are designed so a run that stops early still tells you *why* instead of returning nothing.
+
+### Tool-call budget is per turn
+
+`OpenClaw:Tooling:MaxToolCallsPerTurn` (contract policy `MaxToolCalls`) counts tool calls **in the current turn**, not in the lifetime of the session. The counter resets on every new user message; a long session no longer exhausts a budget it inherited from earlier work.
+
+When the budget runs out, further tool calls are denied by the contract hook with failure code `tool_call_budget_exhausted` and a message that tells the model to answer from the results it already holds rather than retrying:
+
+```json
+{
+  "error": "Tool call budget exhausted for this turn (32/32). Do not call more tools; answer from the results you already have.",
+  "failureCode": "tool_call_budget_exhausted"
+}
+```
+
+Treat this code as recoverable: the turn is not broken, the model has what it needs to produce a final answer. Clients that surface failures to a human should not render it as an infrastructure error.
+
+### Delegated sub-agents reserve the last iteration for an answer
+
+A `delegate_agent` child runs a bounded iteration loop. The final iteration is reserved: tools are withheld, the model is told it is the last call, and whatever text comes back becomes the delegation result. This exists because the old behaviour — burning the limit on one more tool call and then returning "maximum iterations reached" — delivered no information at all.
+
+When the reserved call produced an answer, the result is prefixed with a marker:
+
+```
+[DELEGATION_INCOMPLETE: partial]
+…
+```
+
+The delegation metadata carries `ResultIncomplete: true` alongside the preview. The answer is real work and should be used; the marker says the task may not be finished and the child ran out of iterations rather than deciding it was done. A delegation that finishes normally carries no marker and reads as complete.
+
+Both the native `AgentRuntime` and the Microsoft Agent Framework `MafAgentRuntime` implement this contract; `AgentRuntimeFactoryContext.ReserveFinalIterationForAnswer` is the single switch, and `DelegateTool` is the only thing that turns it on.
 
 ---
 

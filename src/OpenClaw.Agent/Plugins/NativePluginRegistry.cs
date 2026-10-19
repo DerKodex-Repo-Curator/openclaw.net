@@ -37,7 +37,10 @@ public sealed class NativePluginRegistry : IDisposable
             RegisterTool(new GitTool(config.GitTools), "git-tools");
 
         if (config.CodeExec.Enabled)
+        {
             RegisterTool(new CodeExecTool(config.CodeExec, toolingConfig), "code-exec", config.CodeExec.Backend);
+            WarnWhenCodeExecReachesApprovalGatedTools(config.CodeExec, toolingConfig);
+        }
 
         if (config.ImageGen.Enabled)
             RegisterTool(new ImageGenTool(config.ImageGen, toolingConfig, _modelProfiles), "image-gen", config.ImageGen.Provider);
@@ -111,6 +114,36 @@ public sealed class NativePluginRegistry : IDisposable
 
     public void RegisterExternalTool(ITool tool, string pluginId, string? detail = null)
         => RegisterTool(tool, pluginId, detail);
+
+    /// <summary>
+    /// Makes the trust boundary of <c>code_exec</c> visible at startup.
+    /// </summary>
+    /// <remarks>
+    /// The <c>process</c> backend runs generated code as a child of the gateway: same user, same
+    /// environment, same loopback network. Such code can therefore call the gateway's own HTTP/MCP
+    /// surface, and an approval-required tool becomes reachable without its approval prompt. That is
+    /// inherent to running arbitrary code rather than a bug to fix here — but an operator who
+    /// believes approval policy is in force needs to know it is not, and a log line at startup is
+    /// the only place they will find out before it matters.
+    /// </remarks>
+    private void WarnWhenCodeExecReachesApprovalGatedTools(CodeExecConfig codeExec, ToolingConfig? toolingConfig)
+    {
+        if (!CodeExecTool.RunsWithGatewayPrivileges(codeExec))
+            return;
+
+        var gated = toolingConfig?.ApprovalRequiredTools;
+        if (gated is not { Length: > 0 })
+            return;
+
+        _logger.LogWarning(
+            "code_exec backend '{Backend}' runs generated code with the gateway's own privileges and network access, " +
+            "so the {Count} approval-required tool(s) ({Tools}) can be invoked from that code without their approval " +
+            "prompt. Configure OpenClaw:Plugins:Native:CodeExec:Backend=docker (network-isolated) if approval policy " +
+            "is relied upon for containment.",
+            codeExec.Backend,
+            gated.Length,
+            string.Join(", ", gated));
+    }
 
     public void RegisterOwnedResource(IDisposable resource)
     {

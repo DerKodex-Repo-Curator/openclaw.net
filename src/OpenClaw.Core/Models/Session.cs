@@ -837,6 +837,9 @@ public sealed class SessionDelegationMetadata
     public string? FinalResponsePreview { get; set; }
     public IReadOnlyList<SessionDelegationToolUsage> ToolUsage { get; set; } = [];
     public IReadOnlyList<SessionDelegationChangeSummary> ProposedChanges { get; set; } = [];
+
+    /// <summary>Mirror of <see cref="SessionDelegationChildSummary.ResultIncomplete"/> on the child session.</summary>
+    public bool ResultIncomplete { get; set; }
 }
 
 public sealed class SessionDelegationToolUsage
@@ -866,6 +869,13 @@ public sealed class SessionDelegationChildSummary
     public IReadOnlyList<SessionDelegationToolUsage> ToolUsage { get; set; } = [];
     public IReadOnlyList<SessionDelegationChangeSummary> ProposedChanges { get; set; } = [];
     public string? FinalResponsePreview { get; set; }
+
+    /// <summary>
+    /// True when the sub-agent stopped at its iteration limit, so its result is real work that is
+    /// known not to cover the whole task. Additive and default-false: a pre-existing summary reads
+    /// as complete, which is what it meant before the field existed.
+    /// </summary>
+    public bool ResultIncomplete { get; set; }
 }
 
 /// <summary>
