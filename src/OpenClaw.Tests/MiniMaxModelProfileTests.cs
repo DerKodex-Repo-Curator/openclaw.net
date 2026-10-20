@@ -33,7 +33,7 @@ public sealed class MiniMaxModelProfileTests
         Assert.False(profiles[0].Capabilities!.SupportsReasoningEffort);
         Assert.Equal("minimax-m3", profiles[1].Id);
         Assert.All(profiles, p => Assert.Equal("openai-compatible", p.Provider));
-        foreach (var id in new[] { "gpt-4-1-mini", "glm-4-7" })
+        foreach (var id in new[] { "deepseek-v4-flash", "glm-4-7" })
         {
             Assert.True(registry.TryGet(id, out var routedProfile));
             Assert.DoesNotContain("minimax-m2-7", routedProfile!.FallbackProfileIds);
