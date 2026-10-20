@@ -8,6 +8,7 @@ using Microsoft.Extensions.Logging;
 using OpenClaw.Core.Models;
 using OpenClaw.Gateway.Extensions;
 using OpenClaw.Gateway.Models;
+using Xunit;
 
 namespace OpenClaw.Tests;
 
@@ -25,7 +26,8 @@ public sealed class MiniMaxModelProfileTests
         Assert.Equal(new[] { "MiniMax-M3.1-Flash", "MiniMax-M3" }, profiles.Select(p => p.Model));
         Assert.Equal("minimax-m3-1-flash", profiles[0].Id);
         Assert.Equal(1_000_000, profiles[0].Capabilities!.MaxContextTokens);
-        Assert.True(profiles[0].Capabilities!.SupportsReasoningEffort);
+        // The current runtime does not forward session effort through the SDK adapter.
+        Assert.False(profiles[0].Capabilities!.SupportsReasoningEffort);
         Assert.Equal("minimax-m3", profiles[1].Id);
         Assert.All(profiles, p => Assert.Equal("openai-compatible", p.Provider));
         foreach (var id in new[] { "gpt-4-1-mini", "glm-4-7" })
@@ -38,17 +40,12 @@ public sealed class MiniMaxModelProfileTests
     }
 
     [Theory]
-    [InlineData("minimax-m3-1-flash", "MiniMax-M3.1-Flash", "https://api.minimax.io/v1", null)]
-    [InlineData("minimax-m3-1-flash", "MiniMax-M3.1-Flash", "https://api.minimaxi.com/v1", null)]
-    [InlineData("minimax-m3", "MiniMax-M3", "https://api.minimax.io/v1", null)]
-    [InlineData("minimax-m3", "MiniMax-M3", "https://api.minimaxi.com/v1", null)]
-    [InlineData("minimax-m3-1-flash", "MiniMax-M3.1-Flash", "https://api.minimax.io/v1", "low")]
-    [InlineData("minimax-m3-1-flash", "MiniMax-M3.1-Flash", "https://api.minimax.io/v1", "medium")]
-    [InlineData("minimax-m3-1-flash", "MiniMax-M3.1-Flash", "https://api.minimax.io/v1", "high")]
-    [InlineData("minimax-m3-1-flash", "MiniMax-M3.1-Flash", "https://api.minimax.io/v1", "xhigh")]
-    [InlineData("minimax-m3-1-flash", "MiniMax-M3.1-Flash", "https://api.minimax.io/v1", "max")]
-    public async Task BundledProfiles_SendExactModelAndSupportedThinkingOptions(
-        string profileId, string model, string endpoint, string? effort)
+    [InlineData("minimax-m3-1-flash", "MiniMax-M3.1-Flash", "https://api.minimax.io/v1")]
+    [InlineData("minimax-m3-1-flash", "MiniMax-M3.1-Flash", "https://api.minimaxi.com/v1")]
+    [InlineData("minimax-m3", "MiniMax-M3", "https://api.minimax.io/v1")]
+    [InlineData("minimax-m3", "MiniMax-M3", "https://api.minimaxi.com/v1")]
+    public async Task BundledProfiles_SendExactModelAndDefaultThinkingOptions(
+        string profileId, string model, string endpoint)
     {
         var config = LoadConfig();
         config.Models.Profiles.Single(p => p.Id == profileId).BaseUrl = endpoint;
@@ -58,7 +55,7 @@ public sealed class MiniMaxModelProfileTests
         Assert.Equal(endpoint, provider.Endpoint);
         Assert.Equal(model, provider.Model);
 
-        await AssertRequestAsync(provider, model, effort);
+        await AssertRequestAsync(provider, model);
     }
 
     [Theory]
@@ -77,7 +74,7 @@ public sealed class MiniMaxModelProfileTests
         });
         using var registry = ConfiguredModelProfileRegistry.CreateInitialized(config);
         Assert.True(registry.TryGet("user-defined", out var profile));
-        await AssertRequestAsync(ConfiguredModelProfileRegistry.BuildProviderConfig(config, profile!), model, null);
+        await AssertRequestAsync(ConfiguredModelProfileRegistry.BuildProviderConfig(config, profile!), model);
     }
 
     [Theory]
@@ -88,10 +85,10 @@ public sealed class MiniMaxModelProfileTests
         var config = LoadConfig();
         using var registry = ConfiguredModelProfileRegistry.CreateInitialized(config);
         Assert.True(registry.TryGet(profileId, out var profile));
-        await AssertRequestAsync(ConfiguredModelProfileRegistry.BuildProviderConfig(config, profile!), profile!.ModelId, null, image: true);
+        await AssertRequestAsync(ConfiguredModelProfileRegistry.BuildProviderConfig(config, profile!), profile!.ModelId, image: true);
     }
 
-    private static async Task AssertRequestAsync(LlmProviderConfig provider, string model, string? effort, bool image = false)
+    private static async Task AssertRequestAsync(LlmProviderConfig provider, string model, bool image = false)
     {
         var builder = WebApplication.CreateBuilder();
         builder.Logging.ClearProviders();
@@ -101,13 +98,13 @@ public sealed class MiniMaxModelProfileTests
         string? authorization = null;
         app.MapPost("/v1/chat/completions", async (HttpContext context) =>
         {
-            using var body = await JsonDocument.ParseAsync(context.Request.Body);
+            using var body = await JsonDocument.ParseAsync(context.Request.Body, cancellationToken: context.RequestAborted);
             captured = body.RootElement.Clone();
             authorization = context.Request.Headers.Authorization.ToString();
             context.Response.ContentType = "application/json";
             await context.Response.WriteAsync("""
                 {"id":"chatcmpl-test","object":"chat.completion","created":1,"model":"test","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}
-                """);
+                """, context.RequestAborted);
         });
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
         timeout.CancelAfter(TimeSpan.FromSeconds(15));
@@ -118,8 +115,6 @@ public sealed class MiniMaxModelProfileTests
         provider.ApiKey = "test-minimax-key";
         using var client = LlmClientFactory.CreateChatClient(provider);
         var options = new ChatOptions();
-        if (effort is not null)
-            options.AdditionalProperties = new AdditionalPropertiesDictionary { ["reasoning_effort"] = effort };
 
         var message = image
             ? new ChatMessage(ChatRole.User, [new TextContent("Describe this image"), new UriContent("https://example.com/test.png", "image/png")])
@@ -140,10 +135,7 @@ public sealed class MiniMaxModelProfileTests
         Assert.False(request.TryGetProperty("thinking", out _));
         Assert.False(request.TryGetProperty("reasoning_split", out _));
         Assert.False(request.TryGetProperty("service_tier", out _));
-        if (effort is null)
-            Assert.False(request.TryGetProperty("reasoning_effort", out _));
-        else
-            Assert.Equal(effort, request.GetProperty("reasoning_effort").GetString());
+        Assert.False(request.TryGetProperty("reasoning_effort", out _));
     }
 
     private static GatewayConfig LoadConfig()
