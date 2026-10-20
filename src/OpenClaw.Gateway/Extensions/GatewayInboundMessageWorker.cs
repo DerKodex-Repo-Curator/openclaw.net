@@ -572,6 +572,20 @@ internal sealed class GatewayInboundMessageWorker
                                 messageText = await ResolveFileUrlMarkersAsync(messageText, mediaCache, processingCt);
                             }
 
+                            // Channels download inbound media into OS temp and emit [IMAGE_PATH:/tmp/…].
+                            // Copying it into the media cache here is what keeps a session's attachment
+                            // reference valid after a reboot or a temp sweep. Skipped when reference mode
+                            // is off: the marker path reads the file directly and a copy would be waste.
+                            if (mediaCache is not null && config.Multimodal.Attachments.ReferenceMode)
+                            {
+                                messageText = await InboundAttachmentPersister.PersistAsync(
+                                    messageText,
+                                    mediaCache,
+                                    Path.GetFullPath(config.Multimodal.MediaCachePath),
+                                    logger,
+                                    processingCt);
+                            }
+
                             var useStreaming = ShouldUseStreaming(msg, wsChannel);
 
                             var approvalCallback = ToolApprovalCallbackFactory.Create(
@@ -1516,12 +1530,11 @@ internal sealed class GatewayInboundMessageWorker
                 }
             }
 
-            if (!pathAllowed || !File.Exists(fullPath))
+            if (!pathAllowed || !LocalAttachmentFile.TryRead(fullPath, out var bytes))
                 return null;
 
-            var bytes = await File.ReadAllBytesAsync(fullPath, ct);
             var fileName = Path.GetFileName(fullPath);
-            var mimeType = GuessMimeTypeFromExtension(Path.GetExtension(fullPath));
+            var mimeType = AttachmentReferences.TryResolveMediaType(fullPath) ?? "application/octet-stream";
             return await mediaCache.SaveAsync(bytes.AsMemory(), mimeType, fileName, ct);
         }
         catch
@@ -1529,34 +1542,6 @@ internal sealed class GatewayInboundMessageWorker
             return null;
         }
     }
-
-    private static string GuessMimeTypeFromExtension(string extension) =>
-        extension.ToLowerInvariant() switch
-        {
-            ".html" or ".htm" => "text/html",
-            ".css"            => "text/css",
-            ".js"             => "application/javascript",
-            ".json"           => "application/json",
-            ".xml"            => "application/xml",
-            ".txt"            => "text/plain",
-            ".md"             => "text/markdown",
-            ".csv"            => "text/csv",
-            ".py"             => "text/x-python",
-            ".sh"             => "text/x-sh",
-            ".zip"            => "application/zip",
-            ".tar"            => "application/x-tar",
-            ".gz"             => "application/gzip",
-            ".pdf"            => "application/pdf",
-            ".png"            => "image/png",
-            ".jpg" or ".jpeg" => "image/jpeg",
-            ".gif"            => "image/gif",
-            ".svg"            => "image/svg+xml",
-            ".webp"           => "image/webp",
-            ".mp3"            => "audio/mpeg",
-            ".wav"            => "audio/wav",
-            ".mp4"            => "video/mp4",
-            _                 => "application/octet-stream"
-        };
 
     // Builds a newline-prefixed block of [FILE_URL:] markers to append to response text.
     // Format: [FILE_URL:/media/{id}|{fileName}] so preprocessMediaMarkers can render a named link.

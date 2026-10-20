@@ -143,6 +143,49 @@ public sealed class MetaInvocationStoreTests
         }
     }
 
+    [Fact]
+    public async Task MarkInterruptedInvocationsUncertainAsync_WhenItRacesLiveClaims_ShouldNeverThrowAndKeepRunsRunning()
+    {
+        var storagePath = CreateStoragePath();
+        var cancellationToken = TestContext.Current.CancellationToken;
+
+        try
+        {
+            using var liveStore = new MetaInvocationStore(storagePath, retentionDays: 30);
+            using var sweeperStore = new MetaInvocationStore(storagePath, retentionDays: 30);
+
+            var claimed = await liveStore.BeginOrGetAsync("caller", "key", "hash", cancellationToken);
+
+            // Two store instances over one ledger reproduce the cross-handle lease open that Windows
+            // reports as UnauthorizedAccessException: the sweep probes every Running record it did not
+            // lease itself, which includes the lease liveStore is still holding. Interleaving it with
+            // fresh claims keeps those probes landing on a held lease rather than on a file that was
+            // already released.
+            var sweep = Task.Run(async () =>
+            {
+                for (var index = 0; index < 20; index++)
+                    await sweeperStore.MarkInterruptedInvocationsUncertainAsync(cancellationToken);
+            }, cancellationToken);
+            var claims = Task.Run(async () =>
+            {
+                for (var index = 0; index < 20; index++)
+                    await liveStore.BeginOrGetAsync("caller", $"live-{index}", "hash", cancellationToken);
+            }, cancellationToken);
+
+            await Task.WhenAll(sweep, claims);
+
+            var existing = await sweeperStore.BeginOrGetAsync("caller", "key", "hash", cancellationToken);
+
+            Assert.Equal(MetaInvocationClaimKind.Existing, existing.Kind);
+            Assert.Equal(claimed.Record.InvocationId, existing.Record.InvocationId);
+            Assert.Equal(MetaInvocationStatus.Running, existing.Record.Status);
+        }
+        finally
+        {
+            Directory.Delete(storagePath, recursive: true);
+        }
+    }
+
     private static string CreateStoragePath()
     {
         var path = Path.Join(Path.GetTempPath(), "openclaw-meta-invocation-store-tests", Guid.NewGuid().ToString("N"));

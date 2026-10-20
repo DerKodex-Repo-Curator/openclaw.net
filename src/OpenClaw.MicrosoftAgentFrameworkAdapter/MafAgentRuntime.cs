@@ -71,6 +71,7 @@ public sealed class MafAgentRuntime : IAgentRuntime
     private readonly Func<Session, bool>? _isContractRuntimeBudgetExceeded;
     private readonly Action<Session, string>? _appendContractSnapshot;
     private readonly string? _memoryRecallPrefix;
+    private readonly ChatMessageComposer _messageComposer;
     private readonly bool _backgroundExecutionEnabled;
     private readonly object _skillGate = new();
     private IReadOnlyList<AITool> _mafTools;
@@ -145,6 +146,12 @@ public sealed class MafAgentRuntime : IAgentRuntime
         var projectId = context.Config.Memory.ProjectId
             ?? Environment.GetEnvironmentVariable("OPENCLAW_PROJECT");
         _memoryRecallPrefix = string.IsNullOrWhiteSpace(projectId) ? null : $"project:{projectId.Trim()}:";
+
+        // Same composer, same policy object shape as AgentRuntime: attachment inlining must not differ
+        // by runtime, which is the whole reason this stopped being duplicated code.
+        _messageComposer = new ChatMessageComposer(
+            AttachmentInlinePolicy.FromConfig(context.Config.Multimodal.Attachments),
+            logger: logger);
         _chatClient = new MafExecutionServiceChatClient(
             context.LlmExecutionService,
             context.RuntimeMetrics,
@@ -350,14 +357,14 @@ public sealed class MafAgentRuntime : IAgentRuntime
             AgentSession mafSession = await _sessionStateStore.LoadAsync(agent, session, sidecarHistoryHash, ct);
             var toolInvocations = new List<ToolInvocation>();
 
-            session.History.Add(new ChatTurn { Role = "user", Content = userMessage });
+            session.History.Add(AttachmentReferences.CreateUserTurn(userMessage, _messageComposer.Policy.ReferenceMode));
 
             if (_enableCompaction)
                 await CompactHistoryAsync(session, ct, turnCtx.CorrelationId);
             else
                 TrimHistory(session);
 
-            var messages = BuildMessages(session);
+            var messages = await BuildMessagesAsync(session, ct).ConfigureAwait(false);
             if (_toolExecutor.GetAudienceProfile(session) is not { IncludePrivateContext: false })
                 await TryInjectRecallAsync(messages, userMessage, ct);
 
@@ -615,14 +622,14 @@ public sealed class MafAgentRuntime : IAgentRuntime
             ChatClientAgent agent = CreateAgent(session, userMessage);
             AgentSession mafSession = await _sessionStateStore.LoadAsync(agent, session, sidecarHistoryHash, ct);
 
-            session.History.Add(new ChatTurn { Role = "user", Content = userMessage });
+            session.History.Add(AttachmentReferences.CreateUserTurn(userMessage, _messageComposer.Policy.ReferenceMode));
 
             if (_enableCompaction)
                 await CompactHistoryAsync(session, ct, turnCtx.CorrelationId);
             else
                 TrimHistory(session);
 
-            var messages = BuildMessages(session);
+            var messages = await BuildMessagesAsync(session, ct).ConfigureAwait(false);
             if (_toolExecutor.GetAudienceProfile(session) is not { IncludePrivateContext: false })
                 await TryInjectRecallAsync(messages, userMessage, ct);
 
@@ -1045,7 +1052,7 @@ public sealed class MafAgentRuntime : IAgentRuntime
         var decision = await _turnRoutingPolicy.ResolveAsync(new TurnRoutingRequest
         {
             Session = session,
-            Messages = BuildMessages(session),
+            Messages = await BuildMessagesAsync(session, ct).ConfigureAwait(false),
             UserMessage = userMessage,
             BaseOptions = baseOptions
         }, ct);
@@ -3706,7 +3713,7 @@ public sealed class MafAgentRuntime : IAgentRuntime
             }
             else
             {
-                conversationText.AppendLine($"{turn.Role}: {Truncate(turn.Content, 500)}");
+                conversationText.AppendLine($"{turn.Role}: {Truncate(turn.Content, 500)}{AttachmentReferences.SummarizationNote(turn)}");
             }
         }
 
@@ -3765,35 +3772,18 @@ public sealed class MafAgentRuntime : IAgentRuntime
         }
     }
 
-    private List<ChatMessage> BuildMessages(Session session)
-    {
-        var messages = new List<ChatMessage>();
-        var skip = Math.Max(0, session.History.Count - _maxHistoryTurns);
-        for (var i = skip; i < session.History.Count; i++)
-        {
-            var turn = session.History[i];
-            if (turn.Role == "system" && turn.Content.StartsWith("[Previous conversation summary:", StringComparison.Ordinal))
-            {
-                messages.Add(new ChatMessage(ChatRole.System, turn.Content));
-            }
-            else if (turn.Role is "user" or "assistant" && turn.Content != "[tool_use]")
-            {
-                messages.Add(new ChatMessage(
-                    turn.Role == "user" ? ChatRole.User : ChatRole.Assistant,
-                    turn.Content));
-            }
-            else if (turn.Content == "[tool_use]" && turn.ToolCalls is { Count: > 0 })
-            {
-                var toolSummary = string.Join(
-                    "\n",
-                    turn.ToolCalls.Select(tc =>
-                        $"- Called {tc.ToolName}: {Truncate(tc.Result ?? "(no result)", 200)}"));
-                messages.Add(new ChatMessage(ChatRole.Assistant, $"[Previous tool calls:\n{toolSummary}]"));
-            }
-        }
-
-        return messages;
-    }
+    /// <summary>
+    /// Session history → chat messages.
+    /// </summary>
+    /// <remarks>
+    /// Delegates to <see cref="ChatMessageComposer"/> so this runtime sees the same multimodal content
+    /// the self-built runtime does. It previously rendered every turn as a plain string via
+    /// <see cref="AttachmentReferences.RenderMarkerText"/>, which meant a user's image arrived at the
+    /// model as the literal text <c>[IMAGE_URL:https://…]</c> — a parity gap, not a style choice.
+    /// <c>exactLatestToolBatch</c> stays false here because this path never resumes from a checkpoint.
+    /// </remarks>
+    private ValueTask<List<ChatMessage>> BuildMessagesAsync(Session session, CancellationToken ct)
+        => _messageComposer.ComposeHistoryAsync(session, _maxHistoryTurns, exactLatestToolBatch: false, ct);
 
     private void ApplySkills(IReadOnlyList<SkillDefinition> skills)
     {

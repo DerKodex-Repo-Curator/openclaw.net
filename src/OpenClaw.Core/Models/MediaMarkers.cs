@@ -133,6 +133,39 @@ public static class MediaMarkerProtocol
         return false;
     }
 
+    /// <summary>
+    /// Renders a marker back to its wire form — the exact inverse of <see cref="TryParseMarker"/>.
+    /// </summary>
+    /// <remarks>
+    /// Used by the attachment-reference path, which stores markers structurally and has to rebuild
+    /// the original line for consumers that can only send text. Values parsed out of a line can never
+    /// contain <c>]</c>, so the round trip is lossless; a hand-constructed marker whose value does
+    /// contain one would produce a line that no longer parses, which is why nothing outside parsed
+    /// content should call this.
+    /// </remarks>
+    public static string Format(MediaMarker marker)
+    {
+        ArgumentNullException.ThrowIfNull(marker);
+
+        return marker.Kind switch
+        {
+            MediaMarkerKind.ImageUrl => $"[IMAGE_URL:{marker.Value}]",
+            MediaMarkerKind.ImagePath => $"[IMAGE_PATH:{marker.Value}]",
+            MediaMarkerKind.FileUrl => $"[FILE_URL:{marker.Value}]",
+            MediaMarkerKind.FilePath => $"[FILE_PATH:{marker.Value}]",
+            MediaMarkerKind.VideoUrl => $"[VIDEO_URL:{marker.Value}]",
+            MediaMarkerKind.AudioUrl => $"[AUDIO_URL:{marker.Value}]",
+            MediaMarkerKind.DocumentUrl => $"[DOCUMENT_URL:{marker.Value}]",
+            MediaMarkerKind.StickerUrl => $"[STICKER_URL:{marker.Value}]",
+            MediaMarkerKind.TelegramImageFileId => $"[IMAGE:telegram:file_id={marker.Value}]",
+            MediaMarkerKind.TelegramVideoFileId => $"[VIDEO:telegram:file_id={marker.Value}]",
+            MediaMarkerKind.TelegramAudioFileId => $"[AUDIO:telegram:file_id={marker.Value}]",
+            MediaMarkerKind.TelegramDocumentFileId => $"[DOCUMENT:telegram:file_id={marker.Value}]",
+            MediaMarkerKind.TelegramStickerFileId => $"[STICKER:telegram:file_id={marker.Value}]",
+            _ => marker.Value
+        };
+    }
+
     private static bool TryParseBracketValue(string line, string prefix, out string value)
     {
         value = "";

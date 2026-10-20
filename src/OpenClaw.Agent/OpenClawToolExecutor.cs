@@ -139,6 +139,9 @@ public sealed class OpenClawToolExecutor
             : $"{(profile.IncludePrivateContext ? "private" : "public")}:{(profile.AllowAttachments ? "attachments" : "no-attachments")}";
         if (session.History.Count > 0 && NarrowsContext(session.AudienceContextKey, contextKey))
             return "Audience policy narrowed. Start a new session to keep prior private context isolated.";
+        // Must be called with the *raw* inbound message, before AttachmentReferences.CreateUserTurn
+        // lifts marker lines into ChatTurn.Attachments. Once attachments are referenced, the message
+        // text no longer contains them and this guard would silently stop firing.
         if (profile is { AllowAttachments: false } && MediaMarkerProtocol.Extract(message).Markers.Count > 0)
             return "Attachments are disabled for this audience.";
         session.AudienceContextKey = contextKey;

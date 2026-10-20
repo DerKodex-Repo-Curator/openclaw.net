@@ -623,6 +623,10 @@ public sealed class MetaInvocationStore : IHostedService, IDisposable
             }
             catch (IOException ex) when (IsLockContention(ex))
             {
+                // Deliberately not extended to UnauthorizedAccessException the way
+                // TryAcquireInvocationLease is: this ledger lock is opened without DeleteOnClose, so
+                // contention always arrives as a sharing violation, while access-denied here would
+                // mean a real permission problem—and retrying that forever would hang every caller.
                 await Task.Delay(50, cancellationToken);
             }
         }
@@ -647,6 +651,22 @@ public sealed class MetaInvocationStore : IHostedService, IDisposable
         }
         catch (IOException ex) when (IsLockContention(ex))
         {
+            return null;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            // On Windows a lease that another handle already owns is not reported as a sharing
+            // violation: because the owner opened it with FileOptions.DeleteOnClose, the name is
+            // delete-pending, so any second open by name fails with ERROR_ACCESS_DENIED (5) and
+            // surfaces as UnauthorizedAccessException — which does not derive from IOException and
+            // therefore slips past the filter above. Linux maps the same flock conflict to
+            // IOException, which is why this only ever failed on Windows.
+            //
+            // Treating it as "held elsewhere" is both correct and fail-safe: the only way to reach
+            // this line is after successfully opening the ledger lock in the same directory, so the
+            // directory is writable and access-denied here means the lease itself is spoken for.
+            // Returning null makes the sweep leave the invocation Running rather than declare a live
+            // run Uncertain.
             return null;
         }
     }

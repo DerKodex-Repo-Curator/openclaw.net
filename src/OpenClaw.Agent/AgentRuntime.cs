@@ -43,6 +43,7 @@ public sealed class AgentRuntime : IAgentRuntime
     private readonly AgentTurnAccounting _accounting;
     private readonly AgentModelExecutor _modelExecutor;
     private readonly AgentPromptContextAssembler _contextAssembler;
+    private readonly ChatMessageComposer _messageComposer;
     private readonly ILogger? _logger;
     private string _systemPrompt = string.Empty;
     private readonly int _maxTokens;
@@ -216,8 +217,11 @@ public sealed class AgentRuntime : IAgentRuntime
             isContractTokenBudgetExceeded, isContractRuntimeBudgetExceeded, recordContractTurnUsage,
             appendContractSnapshot, logger);
         _modelExecutor = new AgentModelExecutor(chatClient, config, _circuitBreaker, llmExecutionService, _accounting, logger);
+        _messageComposer = new ChatMessageComposer(
+            AttachmentInlinePolicy.FromConfig(gatewayConfig?.Multimodal.Attachments),
+            logger: logger);
         _contextAssembler = new AgentPromptContextAssembler(memory, requireToolApproval, recall, profileStore,
-            profilesConfig, contextBudgetPlanner, _fractalMemory, metrics, logger, _memoryRecallPrefix);
+            profilesConfig, contextBudgetPlanner, _fractalMemory, metrics, logger, _memoryRecallPrefix, _messageComposer);
         ApplySkills(skills ?? []);
     }
 
@@ -374,7 +378,7 @@ public sealed class AgentRuntime : IAgentRuntime
         if (resumeCheckpoint is null)
         {
             // Record user turn
-            session.History.Add(new ChatTurn { Role = "user", Content = userMessage });
+            session.History.Add(AttachmentReferences.CreateUserTurn(userMessage, _messageComposer.Policy.ReferenceMode));
 
             // Compaction or simple trim
             if (_enableCompaction)
@@ -395,7 +399,8 @@ public sealed class AgentRuntime : IAgentRuntime
             using var turnRoutingScope = await ApplyTurnRoutingAsync(session, userMessage, resumeCheckpoint is not null, responseSchema, ct);
 
         // Build conversation for LLM
-        var messages = BuildMessages(session, exactLatestToolBatch: resumeCheckpoint is not null, userMessage: userMessage);
+        var messages = await BuildMessagesAsync(session, exactLatestToolBatch: resumeCheckpoint is not null, userMessage: userMessage, ct: ct)
+            .ConfigureAwait(false);
         if (resumeCheckpoint is not null)
         {
             messages.Insert(1, new ChatMessage(ChatRole.System, AgentCheckpointManager.BuildCheckpointResumeInstruction(resumeCheckpoint)));
@@ -741,7 +746,7 @@ public sealed class AgentRuntime : IAgentRuntime
         var resumeCheckpoint = AgentCheckpointManager.TryGetResumableCheckpoint(session);
         if (resumeCheckpoint is null)
         {
-            session.History.Add(new ChatTurn { Role = "user", Content = userMessage });
+            session.History.Add(AttachmentReferences.CreateUserTurn(userMessage, _messageComposer.Policy.ReferenceMode));
 
             if (_enableCompaction)
                 await CompactHistoryAsync(session, ct, resolvedCorrelationId);
@@ -760,7 +765,8 @@ public sealed class AgentRuntime : IAgentRuntime
 
             using var turnRoutingScope = await ApplyTurnRoutingAsync(session, userMessage, resumeCheckpoint is not null, responseSchema: null, ct);
 
-        var messages = BuildMessages(session, exactLatestToolBatch: resumeCheckpoint is not null, userMessage: userMessage);
+        var messages = await BuildMessagesAsync(session, exactLatestToolBatch: resumeCheckpoint is not null, userMessage: userMessage, ct: ct)
+            .ConfigureAwait(false);
         if (resumeCheckpoint is not null)
         {
             messages.Insert(1, new ChatMessage(ChatRole.System, AgentCheckpointManager.BuildCheckpointResumeInstruction(resumeCheckpoint)));
@@ -1045,7 +1051,7 @@ public sealed class AgentRuntime : IAgentRuntime
             }
             else
             {
-                conversationText.AppendLine($"{turn.Role}: {Truncate(turn.Content, 500)}");
+                conversationText.AppendLine($"{turn.Role}: {Truncate(turn.Content, 500)}{AttachmentReferences.SummarizationNote(turn)}");
             }
         }
 
@@ -1110,8 +1116,13 @@ public sealed class AgentRuntime : IAgentRuntime
         }
     }
 
-    private List<ChatMessage> BuildMessages(Session session, bool exactLatestToolBatch = false, string? userMessage = null)
-        => _contextAssembler.BuildMessages(session, _maxHistoryTurns, exactLatestToolBatch, GetSystemPrompt(session, userMessage));
+    private ValueTask<List<ChatMessage>> BuildMessagesAsync(
+        Session session,
+        bool exactLatestToolBatch = false,
+        string? userMessage = null,
+        CancellationToken ct = default)
+        => _contextAssembler.BuildMessagesAsync(
+            session, _maxHistoryTurns, exactLatestToolBatch, GetSystemPrompt(session, userMessage), ct);
 
     private string GetSystemPrompt(Session session, string? userMessage = null)
     {
@@ -1278,7 +1289,7 @@ public sealed class AgentRuntime : IAgentRuntime
         var decision = await _turnRoutingPolicy.ResolveAsync(new TurnRoutingRequest
         {
             Session = session,
-            Messages = BuildMessages(session, exactLatestToolBatch),
+            Messages = await BuildMessagesAsync(session, exactLatestToolBatch, ct: ct).ConfigureAwait(false),
             UserMessage = userMessage,
             BaseOptions = baseOptions
         }, ct);
@@ -3850,45 +3861,6 @@ public sealed class AgentRuntime : IAgentRuntime
             session.ReasoningEffort = snapshot.ReasoningEffort;
             session.ResponseMode = snapshot.ResponseMode;
         }
-    }
-
-    private static IList<AIContent> BuildTurnContents(string content)
-    {
-        var (markers, remainingText) = MediaMarkerProtocol.Extract(content);
-        var contents = new List<AIContent>();
-        if (!string.IsNullOrWhiteSpace(remainingText))
-            contents.Add(new TextContent(remainingText));
-
-        foreach (var marker in markers)
-        {
-            var mediaType = marker.Kind switch
-            {
-                MediaMarkerKind.ImageUrl or MediaMarkerKind.ImagePath or MediaMarkerKind.TelegramImageFileId => "image/*",
-                MediaMarkerKind.AudioUrl or MediaMarkerKind.TelegramAudioFileId => "audio/*",
-                MediaMarkerKind.VideoUrl or MediaMarkerKind.TelegramVideoFileId => "video/*",
-                MediaMarkerKind.DocumentUrl or MediaMarkerKind.FileUrl or MediaMarkerKind.FilePath or MediaMarkerKind.TelegramDocumentFileId => "application/octet-stream",
-                _ => "application/octet-stream"
-            };
-
-            switch (marker.Kind)
-            {
-                case MediaMarkerKind.ImagePath:
-                case MediaMarkerKind.FilePath:
-                    contents.Add(new UriContent(new Uri(Path.GetFullPath(marker.Value)), mediaType));
-                    break;
-                default:
-                    if (Uri.TryCreate(marker.Value, UriKind.Absolute, out var uri))
-                        contents.Add(new UriContent(uri, mediaType));
-                    else if (Uri.TryCreate(marker.Value, UriKind.Relative, out _))
-                        contents.Add(new TextContent(marker.Value));
-                    break;
-            }
-        }
-
-        if (contents.Count == 0)
-            contents.Add(new TextContent(content));
-
-        return contents;
     }
 
     private void ApplySkills(IReadOnlyList<SkillDefinition> skills)

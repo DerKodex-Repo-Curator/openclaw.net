@@ -226,6 +226,53 @@ public class EmbeddedLocalChatClientTests
     }
 
     [Fact]
+    public async Task GetResponseAsync_MaterializesFileUriAsDataUrl()
+    {
+        // A file: URI originates from legacy turns (markers still in Content) and from
+        // ReferenceMode=false. The local server cannot resolve it, so it has to be inlined here —
+        // forwarding "file:///C:/..." would reach the model as an unopenable URL.
+        var directory = Path.Combine(Path.GetTempPath(), "openclaw-tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        var path = Path.Combine(directory, "cat.png");
+        await File.WriteAllBytesAsync(path, [1, 2, 3], TestContext.Current.CancellationToken);
+
+        try
+        {
+            var handler = new FakeHttpMessageHandler();
+            using var client = new EmbeddedLocalChatClient(
+                new LlmProviderConfig { Provider = "embedded", Model = "gemma-local-small-q4" },
+                new LocalInferenceConfig(),
+                new FakeLocalInferenceSupervisor(),
+                new HttpClient(handler));
+
+            await client.GetResponseAsync(
+                [
+                    new ChatMessage(ChatRole.User, new List<AIContent>
+                    {
+                        new TextContent("Look at this"),
+                        // "image/*" is what the marker path always produced; a wildcard is not a valid
+                        // MIME type inside a data URL, so the adapter resolves the extension instead.
+                        new UriContent(new Uri(path), "image/*")
+                    })
+                ],
+                cancellationToken: TestContext.Current.CancellationToken);
+
+            Assert.NotNull(handler.LastRequestBody);
+            Assert.DoesNotContain("file://", handler.LastRequestBody, StringComparison.OrdinalIgnoreCase);
+
+            using var document = JsonDocument.Parse(handler.LastRequestBody);
+            var contentArray = document.RootElement.GetProperty("messages")[0].GetProperty("content");
+            Assert.Equal(
+                "data:image/png;base64,AQID",
+                contentArray[1].GetProperty("image_url").GetProperty("url").GetString());
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task GetResponseAsync_ExpandsVideoIntoOrderedImageFrames()
     {
         var handler = new FakeHttpMessageHandler();

@@ -15,7 +15,7 @@ namespace OpenClaw.Tests;
 public sealed class AgentRuntimeComponentTests
 {
     [Fact]
-    public void PromptContextAssembler_BuildMessages_ReconstructsMediaAndCheckpointToolBatch()
+    public async Task PromptContextAssembler_BuildMessages_ReconstructsMediaAndCheckpointToolBatch()
     {
         var assembler = new AgentPromptContextAssembler(
             Substitute.For<IMemoryStore>(),
@@ -58,7 +58,7 @@ public sealed class AgentRuntimeComponentTests
             ]
         });
 
-        var messages = assembler.BuildMessages(session, maxHistoryTurns: 10, exactLatestToolBatch: true);
+        var messages = await assembler.BuildMessagesAsync(session, maxHistoryTurns: 10, exactLatestToolBatch: true);
 
         Assert.Contains("[Route Instructions]", messages[0].Text, StringComparison.Ordinal);
         Assert.Contains("routed test agent", messages[0].Text, StringComparison.Ordinal);
@@ -225,7 +225,7 @@ public sealed class AgentRuntimeComponentTests
 
         var session = new Session { Id = "sess-recall", ChannelId = "websocket", SenderId = "user" };
         session.History.Add(new ChatTurn { Role = "user", Content = "what should I remember?" });
-        var messages = assembler.BuildMessages(session, maxHistoryTurns: 10);
+        var messages = await assembler.BuildMessagesAsync(session, maxHistoryTurns: 10);
 
         var memoryInjected = await assembler.TryInjectRecallAsync(messages, "what should I remember?", TestContext.Current.CancellationToken);
         await assembler.TryInjectStructuredMemoryContextAsync(messages, session, "what should I remember?", memoryInjected, TestContext.Current.CancellationToken);

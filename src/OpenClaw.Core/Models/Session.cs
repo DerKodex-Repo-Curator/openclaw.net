@@ -223,6 +223,27 @@ public sealed record ChatTurn
     public required string Content { get; init; }
     public DateTimeOffset Timestamp { get; init; } = DateTimeOffset.UtcNow;
     public List<ToolInvocation>? ToolCalls { get; init; }
+
+    /// <summary>
+    /// Media attached to this turn, carried by reference.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <see langword="null"/> means "no attachments <em>or</em> a turn written before attachment
+    /// references existed" — the two cases are deliberately indistinguishable so that sessions
+    /// persisted by older builds keep working: the read path falls back to parsing marker lines out
+    /// of <see cref="Content"/>. An empty list would instead mean "this turn was written by a
+    /// reference-aware build and genuinely had no attachments", which is why
+    /// <see cref="AttachmentReferences.Extract"/> returns null rather than an empty list.
+    /// </para>
+    /// <para>
+    /// No <c>[JsonIgnore]</c> here on purpose: every ChatTurn write goes through
+    /// <see cref="CoreJsonContext"/>, which already sets
+    /// <c>DefaultIgnoreCondition = WhenWritingNull</c> and camelCase naming. A per-property attribute
+    /// would only restate that, and hide the fact that the payload shape is decided there.
+    /// </para>
+    /// </remarks>
+    public List<ChatAttachmentRef>? Attachments { get; init; }
 }
 
 public sealed record ToolInvocation

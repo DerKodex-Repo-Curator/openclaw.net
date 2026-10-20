@@ -12,6 +12,55 @@ public sealed class MultimodalConfig
     public TextToSpeechConfig TextToSpeech { get; set; } = new();
     public GeminiLiveConfig GeminiLive { get; set; } = new();
     public ElevenLabsConfig ElevenLabs { get; set; } = new();
+
+    /// <summary>
+    /// How chat attachments (images/files a user sent) are carried in session history and inlined
+    /// into provider requests. See
+    /// docs/superpowers/specs/2026-10-19-attachment-by-reference-design.md.
+    /// </summary>
+    public AttachmentConfig Attachments { get; set; } = new();
+}
+
+/// <summary>
+/// Attachment reference / inlining policy.
+/// </summary>
+/// <remarks>
+/// Every value here is a cost ceiling, not a capability switch: raising them makes each provider
+/// request carry more media. <see cref="ReferenceMode"/> is the only escape hatch — setting it false
+/// restores the pre-reference behaviour (markers stay in prose, every occurrence is sent as a URI).
+/// </remarks>
+public sealed class AttachmentConfig
+{
+    /// <summary>
+    /// When false, attachments are left as marker text in the turn and rendered exactly as before the
+    /// reference work. Intended as a rollback switch, not a tuning knob.
+    /// </summary>
+    public bool ReferenceMode { get; set; } = true;
+
+    /// <summary>
+    /// How many of the most recent user turns get their attachments inlined. Older turns keep a text
+    /// placeholder. Two covers "look at the picture again"; more only raises the per-request image
+    /// billing ceiling.
+    /// </summary>
+    public int InlineRecentUserTurns { get; set; } = 2;
+
+    /// <summary>
+    /// Total bytes of locally-read attachment data allowed in one provider request. Remote URLs are
+    /// not counted (their size is unknown before fetching and the provider fetches them itself).
+    /// </summary>
+    public long MaxInlineBytesPerRequest { get; set; } = 20L * 1024 * 1024;
+
+    /// <summary>Maximum attachments inlined from a single turn; the rest become placeholders.</summary>
+    public int MaxInlineAttachmentsPerTurn { get; set; } = 4;
+
+    /// <summary>Drop a repeated attachment (same source) after its first inline in a request.</summary>
+    public bool DeduplicateBySource { get; set; } = true;
+
+    /// <summary>
+    /// <c>placeholder</c> (default): an unreadable attachment becomes a text note and the turn still
+    /// runs. <c>fail</c>: the turn fails, for deployments that would rather stop than answer blind.
+    /// </summary>
+    public string FailureMode { get; set; } = "placeholder";
 }
 
 public sealed class AudioTranscriptionConfig

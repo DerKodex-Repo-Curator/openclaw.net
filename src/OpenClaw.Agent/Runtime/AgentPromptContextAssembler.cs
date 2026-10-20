@@ -22,6 +22,7 @@ internal sealed class AgentPromptContextAssembler
     private readonly ILogger? _logger;
     private readonly bool _requireToolApproval;
     private readonly string? _memoryRecallPrefix;
+    private readonly ChatMessageComposer _messageComposer;
     private readonly object _skillGate = new();
     private string _systemPrompt = string.Empty;
     private string[] _loadedSkillNames = [];
@@ -38,7 +39,8 @@ internal sealed class AgentPromptContextAssembler
         FractalMemoryConfig? fractalMemory,
         RuntimeMetrics? metrics,
         ILogger? logger,
-        string? memoryRecallPrefix)
+        string? memoryRecallPrefix,
+        ChatMessageComposer? messageComposer = null)
     {
         if (recall?.Enabled == true && memory is not IMemoryNoteSearch)
             throw new ArgumentException("Enabled _recall requires memory to implement IMemoryNoteSearch.", nameof(memory));
@@ -61,6 +63,7 @@ internal sealed class AgentPromptContextAssembler
         _metrics = metrics;
         _logger = logger;
         _memoryRecallPrefix = memoryRecallPrefix;
+        _messageComposer = messageComposer ?? new ChatMessageComposer(logger: logger);
     }
 
     public IReadOnlyList<string> LoadedSkillNames
@@ -117,56 +120,29 @@ internal sealed class AgentPromptContextAssembler
         }
     }
 
-    public List<ChatMessage> BuildMessages(Session session, int maxHistoryTurns, bool exactLatestToolBatch = false, string? systemPrompt = null)
+    /// <summary>
+    /// System message + history, in that order.
+    /// </summary>
+    /// <remarks>
+    /// The history half is <see cref="ChatMessageComposer"/>'s job — this method only owns the preamble,
+    /// which is why it stayed here when everything else moved out. Async because inlining attachments
+    /// from local files is IO.
+    /// </remarks>
+    public async ValueTask<List<ChatMessage>> BuildMessagesAsync(
+        Session session,
+        int maxHistoryTurns,
+        bool exactLatestToolBatch = false,
+        string? systemPrompt = null,
+        CancellationToken ct = default)
     {
         var messages = new List<ChatMessage>
         {
             new(ChatRole.System, systemPrompt ?? GetSystemPrompt(session))
         };
 
-        var skip = Math.Max(0, session.History.Count - maxHistoryTurns);
-        for (var i = skip; i < session.History.Count; i++)
-        {
-            var turn = session.History[i];
-            if (turn.Role == "system" && turn.Content.StartsWith("[Previous conversation summary:", StringComparison.Ordinal))
-            {
-                messages.Add(new ChatMessage(ChatRole.System, turn.Content));
-            }
-            else if (turn.Role is "user" or "assistant" && turn.Content != "[tool_use]")
-            {
-                messages.Add(new ChatMessage(
-                    turn.Role == "user" ? ChatRole.User : ChatRole.Assistant,
-                    BuildTurnContents(turn.Content)));
-            }
-            else if (turn.Content == "[tool_use]" && turn.ToolCalls is { Count: > 0 })
-            {
-                if (exactLatestToolBatch && i == session.History.Count - 1)
-                {
-                    var callContents = new List<AIContent>(turn.ToolCalls.Count);
-                    var resultContents = new List<AIContent>(turn.ToolCalls.Count);
-                    for (var toolIndex = 0; toolIndex < turn.ToolCalls.Count; toolIndex++)
-                    {
-                        var invocation = turn.ToolCalls[toolIndex];
-                        var callId = AgentCheckpointManager.ResolveCheckpointCallId(invocation, toolIndex);
-                        callContents.Add(new FunctionCallContent(
-                            callId,
-                            invocation.ToolName,
-                            AgentCheckpointManager.DeserializeToolArguments(invocation.Arguments)));
-                        resultContents.Add(new FunctionResultContent(callId, invocation.Result ?? ""));
-                    }
-
-                    messages.Add(new ChatMessage(ChatRole.Assistant, callContents));
-                    messages.Add(new ChatMessage(ChatRole.Tool, resultContents));
-                }
-                else
-                {
-                    var toolSummary = string.Join("\n", turn.ToolCalls.Select(tc =>
-                        $"- Called {tc.ToolName}: {Truncate(tc.Result ?? "(no result)", 200)}"));
-                    messages.Add(new ChatMessage(ChatRole.Assistant,
-                        $"[Previous tool calls:\n{toolSummary}]"));
-                }
-            }
-        }
+        messages.AddRange(await _messageComposer
+            .ComposeHistoryAsync(session, maxHistoryTurns, exactLatestToolBatch, ct)
+            .ConfigureAwait(false));
 
         return messages;
     }
@@ -417,45 +393,6 @@ internal sealed class AgentPromptContextAssembler
             return systemPrompt;
 
         return systemPrompt + "\n\n[Route Instructions]\n" + session.SystemPromptOverride.Trim();
-    }
-
-    private static IList<AIContent> BuildTurnContents(string content)
-    {
-        var (markers, remainingText) = MediaMarkerProtocol.Extract(content);
-        var contents = new List<AIContent>();
-        if (!string.IsNullOrWhiteSpace(remainingText))
-            contents.Add(new TextContent(remainingText));
-
-        foreach (var marker in markers)
-        {
-            var mediaType = marker.Kind switch
-            {
-                MediaMarkerKind.ImageUrl or MediaMarkerKind.ImagePath or MediaMarkerKind.TelegramImageFileId => "image/*",
-                MediaMarkerKind.AudioUrl or MediaMarkerKind.TelegramAudioFileId => "audio/*",
-                MediaMarkerKind.VideoUrl or MediaMarkerKind.TelegramVideoFileId => "video/*",
-                MediaMarkerKind.DocumentUrl or MediaMarkerKind.FileUrl or MediaMarkerKind.FilePath or MediaMarkerKind.TelegramDocumentFileId => "application/octet-stream",
-                _ => "application/octet-stream"
-            };
-
-            switch (marker.Kind)
-            {
-                case MediaMarkerKind.ImagePath:
-                case MediaMarkerKind.FilePath:
-                    contents.Add(new UriContent(new Uri(Path.GetFullPath(marker.Value)), mediaType));
-                    break;
-                default:
-                    if (Uri.TryCreate(marker.Value, UriKind.Absolute, out var uri))
-                        contents.Add(new UriContent(uri, mediaType));
-                    else if (Uri.TryCreate(marker.Value, UriKind.Relative, out _))
-                        contents.Add(new TextContent(marker.Value));
-                    break;
-            }
-        }
-
-        if (contents.Count == 0)
-            contents.Add(new TextContent(content));
-
-        return contents;
     }
 
     private static string Indent(string value, string prefix)

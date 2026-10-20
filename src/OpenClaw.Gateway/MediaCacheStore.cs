@@ -19,7 +19,10 @@ internal sealed class MediaCacheStore
         string fileName,
         CancellationToken ct)
     {
-        var id = $"media_{Guid.NewGuid():N}"[..22];
+        // The id shape is a contract, not an implementation detail: AttachmentReferences.TryGetMediaAssetId
+        // recognises "<prefix><16 hex>" in a file name so that a ChatAttachmentRef pointing at a cached
+        // file carries its AssetId. Changing the shape silently empties that field.
+        var id = AttachmentReferences.MediaAssetIdPrefix + Guid.NewGuid().ToString("N")[..16];
         var extension = GuessExtension(mediaType, fileName);
         var assetPath = Path.Combine(_rootPath, id + extension);
         await File.WriteAllBytesAsync(assetPath, data.ToArray(), ct);

@@ -179,6 +179,12 @@ internal sealed class OllamaChatClient : IChatClient
                         }
                     });
                     break;
+                case DataContent data when data.MediaType?.StartsWith("image/", StringComparison.OrdinalIgnoreCase) == true:
+                    // Attachments inlined from local files now arrive as bytes rather than file:// URIs,
+                    // because the inliner is provider-agnostic and a cloud provider cannot read a local
+                    // path. Ollama wants base64 in `images`, which is exactly what the bytes already are.
+                    images.Add((JsonNode?)JsonValue.Create(Convert.ToBase64String(data.Data.ToArray())));
+                    break;
                 case UriContent uri when uri.MediaType?.StartsWith("image/", StringComparison.OrdinalIgnoreCase) == true:
                     var image = TrySerializeImage(uri.Uri);
                     if (!string.IsNullOrWhiteSpace(image))
@@ -362,20 +368,7 @@ internal sealed class OllamaChatClient : IChatClient
     }
 
     private static string? TrySerializeImage(Uri uri)
-    {
-        if (uri.IsFile && File.Exists(uri.LocalPath))
-            return Convert.ToBase64String(File.ReadAllBytes(uri.LocalPath));
-
-        if (uri.Scheme.Equals("data", StringComparison.OrdinalIgnoreCase))
-        {
-            var raw = uri.OriginalString;
-            var comma = raw.IndexOf(',');
-            if (comma >= 0)
-                return raw[(comma + 1)..];
-        }
-
-        return null;
-    }
+        => MediaPayloadAdapter.ToBase64(uri);
 
     internal static HttpContent CreateJsonContent(JsonNode payload)
         => new StringContent(payload.ToJsonString(), Encoding.UTF8, "application/json");

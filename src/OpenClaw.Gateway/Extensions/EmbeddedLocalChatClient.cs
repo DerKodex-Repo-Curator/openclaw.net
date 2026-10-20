@@ -270,7 +270,13 @@ internal sealed class EmbeddedLocalChatClient : IChatClient
                         break;
                     }
 
-                    AddMediaUrl(array, GetOpenAiContentType(uri.MediaType), uri.Uri?.ToString() ?? "");
+                    // A file: URI cannot be fetched by the local server, so it is materialised into a
+                    // data URL here — the same shape this method already produces for DataContent.
+                    // Remote URLs are forwarded untouched and resolved by the server itself.
+                    AddMediaUrl(
+                        array,
+                        GetOpenAiContentType(uri.MediaType),
+                        MediaPayloadAdapter.ToDataUrl(uri.Uri, uri.MediaType) ?? uri.Uri?.ToString() ?? "");
                     break;
                 }
                 case FunctionResultContent result:
