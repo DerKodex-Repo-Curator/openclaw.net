@@ -24,7 +24,10 @@ public sealed class MiniMaxModelProfileTests
             .ToArray();
 
         Assert.Equal(new[] { "MiniMax-M3.1-Flash", "MiniMax-M3" }, profiles.Select(p => p.Model));
-        Assert.Equal("minimax-m3-1-flash", profiles[0].Id);
+        Assert.Equal(
+            new[] { "MiniMax-M3.1-Flash", "MiniMax-M3" },
+            registry.ListStatuses().Where(p => p.ModelId.StartsWith("MiniMax-", StringComparison.Ordinal)).Select(p => p.ModelId));
+        Assert.Equal("minimax-flash", profiles[0].Id);
         Assert.Equal(1_000_000, profiles[0].Capabilities!.MaxContextTokens);
         // The current runtime does not forward session effort through the SDK adapter.
         Assert.False(profiles[0].Capabilities!.SupportsReasoningEffort);
@@ -34,14 +37,14 @@ public sealed class MiniMaxModelProfileTests
         {
             Assert.True(registry.TryGet(id, out var routedProfile));
             Assert.DoesNotContain("minimax-m2-7", routedProfile!.FallbackProfileIds);
-            Assert.Contains("minimax-m3-1-flash", routedProfile.FallbackProfileIds);
+            Assert.Contains("minimax-flash", routedProfile.FallbackProfileIds);
             Assert.All(routedProfile.FallbackProfileIds, fallback => Assert.True(registry.TryGet(fallback, out _)));
         }
     }
 
     [Theory]
-    [InlineData("minimax-m3-1-flash", "MiniMax-M3.1-Flash", "https://api.minimax.io/v1")]
-    [InlineData("minimax-m3-1-flash", "MiniMax-M3.1-Flash", "https://api.minimaxi.com/v1")]
+    [InlineData("minimax-flash", "MiniMax-M3.1-Flash", "https://api.minimax.io/v1")]
+    [InlineData("minimax-flash", "MiniMax-M3.1-Flash", "https://api.minimaxi.com/v1")]
     [InlineData("minimax-m3", "MiniMax-M3", "https://api.minimax.io/v1")]
     [InlineData("minimax-m3", "MiniMax-M3", "https://api.minimaxi.com/v1")]
     public async Task BundledProfiles_SendExactModelAndDefaultThinkingOptions(
@@ -78,7 +81,7 @@ public sealed class MiniMaxModelProfileTests
     }
 
     [Theory]
-    [InlineData("minimax-m3-1-flash")]
+    [InlineData("minimax-flash")]
     [InlineData("minimax-m3")]
     public async Task BundledProfiles_PreserveImageContent(string profileId)
     {
